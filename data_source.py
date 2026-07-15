@@ -48,7 +48,7 @@ def time_format1(time_str):
     time_str = "2026-07-15T09:00:00.000Z"
     dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
     ts = dt.timestamp()
-    return ts
+    return int(ts)
 
 
 def aviationweather_temp(icao):
