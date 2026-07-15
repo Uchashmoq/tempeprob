@@ -1,0 +1,16 @@
+.env
+.venv/
+venv/
+test-data/
+data/
+refcode/
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.DS_Store%     
