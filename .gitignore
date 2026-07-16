@@ -4,7 +4,7 @@ venv/
 test-data/
 data/
 refcode/
-
+log.*
 __pycache__/
 *.py[cod]
 *$py.class
