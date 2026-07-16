@@ -5,10 +5,30 @@ caller is responsible for constructing the R ``ensembleData`` object expected
 by ``ensembleMOS::ensembleMOS``.
 """
 
+import json
+from pathlib import Path
 from typing import Any
 
 from rpy2 import rinterface
 from rpy2.robjects.packages import importr
+
+
+def load_forecast(city_name, model_name) -> list[dict]:
+    path = Path("data/forecast") / city_name / model_name / "fc.jsonl"
+    with path.open("r", encoding="utf-8") as forecast_file:
+        forecasts = [json.loads(line) for line in forecast_file]
+    forecasts.sort(
+        key=lambda forecast: forecast["meta"]["last_run_initialisation_time"],
+        reverse=True,
+    )
+    return forecasts
+
+def load_temperature(city_name):
+    path = Path("data/temperature") / city_name / "tem.jsonl"
+    with path.open("r", encoding="utf-8") as temperature_file:
+        temperatures = [json.loads(line) for line in temperature_file]
+    temperatures.sort(key=lambda temperature: temperature["time"], reverse=True)
+    return temperatures
 
 
 def ensemble_mos(
