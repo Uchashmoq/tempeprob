@@ -3,7 +3,7 @@
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install pandas requests numpy
+pip install pandas requests numpy rpy2
 ```
 
 
@@ -83,4 +83,45 @@ pip install pandas requests numpy
     "fltCat": "VFR"
   }
 ]
+```
+### fc.jsonl
+```json
+{
+   "model":"ecmwf_aifs025_ensemble",
+   "time":[
+      1784073600,
+      1784077200,
+      1784080800,
+...
+   ],
+   "temperature_2m":[
+      33.2,
+      34.2,
+      35.8,
+...
+   ],
+   "temperature_2m_member01":[
+      33.7,
+      34.6,
+      35.9,
+...
+   ],
+   "meta":{
+      "data_end_time":1785391200,
+      "last_run_availability_time":1784100444,
+      "last_run_initialisation_time":1784073600,
+      "last_run_modification_time":1784100444,
+      "temporal_resolution_seconds":21600,
+      "update_interval_seconds":21600
+   }
+}
+```
+
+### tem.jsonl
+```json
+{
+   "temperature":40,
+   "time":1784109600,
+   "update_time":1784106000.0
+}
 ```
