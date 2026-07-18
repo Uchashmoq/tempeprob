@@ -1,0 +1,292 @@
+"""Tests for daily maximum-temperature EMOS case preparation."""
+
+import json
+import unittest
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from train_emos_max_temperature import (
+    group_daily_max_temperature_emos_training_data,
+)
+
+
+TEST_DATA_DIR = Path(__file__).resolve().parents[1] / "test-data" / "data2"
+
+
+def local_day_timestamps(target_date: date, zone: ZoneInfo) -> list[int]:
+    """Return the UTC hourly grid contained in one local calendar day."""
+    start = datetime.combine(target_date, time.min, tzinfo=zone)
+    end = datetime.combine(target_date + timedelta(days=1), time.min, tzinfo=zone)
+    return list(range(int(start.timestamp()), int(end.timestamp()), 3600))
+
+
+def make_forecast(
+    initialization_time: int,
+    availability_time: int,
+    timestamps: list[int],
+    *,
+    base: float = 0.0,
+) -> dict:
+    return {
+        "model": "test_ensemble",
+        "time": timestamps,
+        "temperature_2m": [base + index for index in range(len(timestamps))],
+        "temperature_2m_member01": [
+            base + 100.0 + index for index in range(len(timestamps))
+        ],
+        "meta": {
+            "last_run_initialisation_time": initialization_time,
+            "last_run_availability_time": availability_time,
+        },
+    }
+
+
+def make_observations(timestamps: list[int], *, base: float = 10.0) -> list[dict]:
+    return [
+        {
+            "time": timestamp,
+            "temperature": base + index,
+            "update_time": timestamp + 300,
+        }
+        for index, timestamp in enumerate(timestamps)
+    ]
+
+
+def load_jsonl(path: Path) -> list[dict]:
+    with path.open("r", encoding="utf-8") as jsonl_file:
+        return [json.loads(line) for line in jsonl_file if line.strip()]
+
+
+class DailyMaxTemperatureGroupingTest(unittest.TestCase):
+    def test_groups_one_complete_local_day_and_calculates_member_maxima(self):
+        zone = ZoneInfo("Asia/Shanghai")
+        target_date = date(2026, 7, 18)
+        timestamps = local_day_timestamps(target_date, zone)
+        initialization_time = int(
+            datetime(2026, 7, 17, tzinfo=timezone.utc).timestamp()
+        )
+        availability_time = int(
+            datetime(2026, 7, 17, 9, tzinfo=timezone.utc).timestamp()
+        )
+
+        groups = group_daily_max_temperature_emos_training_data(
+            [make_forecast(initialization_time, availability_time, timestamps)],
+            make_observations(timestamps),
+            zone,
+        )
+
+        self.assertEqual(set(groups), {("00", 1)})
+        group = groups[("00", 1)]
+        self.assertEqual(group["target_dates"], ["2026-07-18"])
+        self.assertEqual(
+            group["member_names"],
+            (
+                "temperature_2m",
+                "temperature_2m_member01",
+            ),
+        )
+        self.assertEqual(group["forecasts"], [(23.0, 123.0)])
+        self.assertEqual(group["observations"], [33.0])
+        self.assertEqual(group["forecast_counts"], [24])
+        self.assertEqual(group["observation_counts"], [24])
+        self.assertEqual(group["observation_coverages"], [1.0])
+
+    def test_rejects_forecast_not_available_before_local_day(self):
+        zone = ZoneInfo("Asia/Shanghai")
+        target_date = date(2026, 7, 18)
+        timestamps = local_day_timestamps(target_date, zone)
+        initialization_time = int(
+            datetime(2026, 7, 17, tzinfo=timezone.utc).timestamp()
+        )
+        local_day_start = timestamps[0]
+
+        groups = group_daily_max_temperature_emos_training_data(
+            [make_forecast(initialization_time, local_day_start, timestamps)],
+            make_observations(timestamps),
+            zone,
+        )
+
+        self.assertEqual(groups, {})
+
+    def test_requires_complete_days_unless_observation_coverage_is_relaxed(self):
+        zone = ZoneInfo("Asia/Shanghai")
+        target_date = date(2026, 7, 18)
+        timestamps = local_day_timestamps(target_date, zone)
+        initialization_time = int(
+            datetime(2026, 7, 16, tzinfo=timezone.utc).timestamp()
+        )
+        availability_time = initialization_time + 3600
+        forecast = make_forecast(
+            initialization_time,
+            availability_time,
+            timestamps,
+        )
+
+        incomplete_forecast = make_forecast(
+            initialization_time,
+            availability_time,
+            timestamps[:-1],
+        )
+        self.assertEqual(
+            group_daily_max_temperature_emos_training_data(
+                [incomplete_forecast],
+                make_observations(timestamps),
+                zone,
+            ),
+            {},
+        )
+
+        incomplete_observations = make_observations(timestamps[:-1])
+        self.assertEqual(
+            group_daily_max_temperature_emos_training_data(
+                [forecast],
+                incomplete_observations,
+                zone,
+            ),
+            {},
+        )
+
+        relaxed = group_daily_max_temperature_emos_training_data(
+            [forecast],
+            incomplete_observations,
+            zone,
+            minimum_observation_coverage=23 / 24,
+        )
+        self.assertEqual(relaxed[("00", 2)]["observation_coverages"], [23 / 24])
+
+    def test_uses_first_complete_snapshot_without_duplicating_a_run(self):
+        zone = ZoneInfo("Asia/Shanghai")
+        target_date = date(2026, 7, 18)
+        timestamps = local_day_timestamps(target_date, zone)
+        initialization_time = int(
+            datetime(2026, 7, 16, tzinfo=timezone.utc).timestamp()
+        )
+        forecasts = [
+            make_forecast(
+                initialization_time,
+                initialization_time + 3600,
+                timestamps[:-1],
+                base=1000.0,
+            ),
+            make_forecast(
+                initialization_time,
+                initialization_time + 7200,
+                timestamps,
+                base=10.0,
+            ),
+            make_forecast(
+                initialization_time,
+                initialization_time + 10800,
+                timestamps,
+                base=2000.0,
+            ),
+        ]
+
+        groups = group_daily_max_temperature_emos_training_data(
+            forecasts,
+            make_observations(timestamps),
+            zone,
+        )
+
+        group = groups[("00", 2)]
+        self.assertEqual(group["forecasts"], [(33.0, 133.0)])
+        self.assertEqual(
+            group["availability_times"],
+            [initialization_time + 7200],
+        )
+
+    def test_dst_day_uses_23_hour_local_calendar_day(self):
+        zone = ZoneInfo("Europe/Paris")
+        target_date = date(2026, 3, 29)
+        timestamps = local_day_timestamps(target_date, zone)
+        self.assertEqual(len(timestamps), 23)
+        initialization_time = int(
+            datetime(2026, 3, 28, tzinfo=timezone.utc).timestamp()
+        )
+
+        groups = group_daily_max_temperature_emos_training_data(
+            [
+                make_forecast(
+                    initialization_time,
+                    initialization_time + 3600,
+                    timestamps,
+                )
+            ],
+            make_observations(timestamps),
+            zone,
+        )
+
+        group = groups[("00", 1)]
+        self.assertEqual(group["forecast_counts"], [23])
+        self.assertEqual(group["observation_counts"], [23])
+        self.assertEqual(group["forecasts"], [(22.0, 122.0)])
+
+    def test_dst_day_uses_25_hour_local_calendar_day(self):
+        zone = ZoneInfo("Europe/Paris")
+        target_date = date(2026, 10, 25)
+        timestamps = local_day_timestamps(target_date, zone)
+        self.assertEqual(len(timestamps), 25)
+        initialization_time = int(
+            datetime(2026, 10, 24, tzinfo=timezone.utc).timestamp()
+        )
+
+        groups = group_daily_max_temperature_emos_training_data(
+            [
+                make_forecast(
+                    initialization_time,
+                    initialization_time + 3600,
+                    timestamps,
+                )
+            ],
+            make_observations(timestamps),
+            zone,
+        )
+
+        group = groups[("00", 1)]
+        self.assertEqual(group["forecast_counts"], [25])
+        self.assertEqual(group["observation_counts"], [25])
+        self.assertEqual(group["forecasts"], [(24.0, 124.0)])
+
+    def test_groups_real_chongqing_data(self):
+        forecasts = load_jsonl(
+            TEST_DATA_DIR
+            / "forecast"
+            / "Chongqing-ZUCK"
+            / "ecmwf_aifs025_ensemble"
+            / "fc.jsonl"
+        )
+        temperatures = load_jsonl(
+            TEST_DATA_DIR / "temperature" / "Chongqing-ZUCK" / "tem.jsonl"
+        )
+
+        groups = group_daily_max_temperature_emos_training_data(
+            forecasts,
+            temperatures,
+            ZoneInfo("Asia/Shanghai"),
+        )
+
+        self.assertEqual(
+            {key: len(group["target_dates"]) for key, group in groups.items()},
+            {
+                ("00", 1): 2,
+                ("00", 2): 1,
+                ("06", 1): 2,
+                ("06", 2): 1,
+                ("12", 2): 1,
+                ("18", 1): 1,
+            },
+        )
+        self.assertNotIn(("12", 1), groups)
+        self.assertEqual(
+            groups[("00", 1)]["target_dates"],
+            [
+                "2026-07-16",
+                "2026-07-17",
+            ],
+        )
+        self.assertEqual(groups[("00", 1)]["observations"], [40.0, 34.0])
+
+
+if __name__ == "__main__":
+    unittest.main()
