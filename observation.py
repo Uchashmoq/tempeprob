@@ -45,6 +45,10 @@ def save_temperature(city_name, tem):
         file.write("\n")
 
 
+def _tem_eq(tem1, tem2):
+    return tem1["temperature"] == tem2["temperature"] and tem1["time"] == tem2["time"]
+
+
 def update_temperature(city):
     tem = data_source.aviationweather_temp(city["ICAO"])
     city_name = city["name"]
@@ -52,7 +56,7 @@ def update_temperature(city):
     if city_name not in latest_temperature:
         latest_temperature[city_name] = {}
     ltem = latest_temperature[city_name]
-    if tem == ltem:
+    if _tem_eq(tem, ltem):
         return False
     save_temperature(city_name, tem)
     latest_temperature[city_name] = tem
