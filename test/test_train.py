@@ -3,6 +3,7 @@
 import math
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from rpy2 import robjects
 from rpy2.robjects import vectors
@@ -249,6 +250,21 @@ class EnsembleMosTest(unittest.TestCase):
         self.assertEqual(set(fits), {("00", 24)})
         result_classes = set(robjects.r["class"](fits[("00", 24)]))  # type: ignore
         self.assertIn("ensembleMOSnormal", result_classes)
+
+    def test_train_grouped_ensemble_mos_adapts_days_for_each_group(self):
+        group_24h = make_mock_group(number_of_days=5)
+        group_48h = make_mock_group(number_of_days=8)
+        group_48h["forecast_hour"] = 48
+        groups = {("00", 24): group_24h, ("00", 48): group_48h}
+
+        with patch("train.ensemble_mos", side_effect=("fit24", "fit48")) as fit:
+            fits = train_grouped_ensemble_mos(groups, training_days=None)
+
+        self.assertEqual(fits, {("00", 24): "fit24", ("00", 48): "fit48"})
+        self.assertEqual(
+            [call.kwargs["training_days"] for call in fit.call_args_list],
+            [5, 8],
+        )
 
     def test_train_grouped_ensemble_mos_rejects_insufficient_groups(self):
         groups = {("00", 24): make_mock_group(number_of_days=5)}

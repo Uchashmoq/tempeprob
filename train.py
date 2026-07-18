@@ -108,9 +108,14 @@ def group_emos_training_data(
     if max_lead_hours is not None and max_lead_hours < 0:
         raise ValueError("max_lead_hours must be non-negative")
 
-    observations_by_time = {
-        int(item["time"]): float(item["temperature"]) for item in temperatures
-    }
+    observations_by_time: dict[int, float] = {}
+    for temperature in sorted(
+        temperatures,
+        key=lambda item: item["time"],
+    ):
+        observations_by_time[int(temperature["time"])] = float(
+            temperature["temperature"]
+        )
 
     groups: dict[tuple[str, int], dict[str, Any]] = {}
     seen_cases: set[tuple[int, int]] = set()
@@ -345,7 +350,7 @@ def ensemble_mos(
 
 def train_grouped_ensemble_mos(
     groups: dict[tuple[str, int], dict[str, Any]],
-    training_days: int,
+    training_days: int | None = None,
     *,
     input_unit: str = "celsius",
     exchangeable: bool | list[str] | tuple[str, ...] = True,
@@ -357,26 +362,39 @@ def train_grouped_ensemble_mos(
     """Train a Gaussian EMOS model for every initialization/lead group.
 
     With ``dates=NULL`` the R package fits all modeling dates allowed by the
-    rolling ``trainingDays`` rule.  A group needs at least ``training_days``
-    distinct valid dates.  Set ``skip_insufficient=True`` to ignore groups that
+    rolling ``trainingDays`` rule.  Set ``training_days=None`` to use all
+    distinct valid dates available in each group, so groups may use different
+    training-window lengths.  With an explicit value, every group needs at
+    least that many dates; set ``skip_insufficient=True`` to ignore groups that
     have not accumulated enough history yet.
     """
 
-    if training_days <= 0:
+    if training_days is not None and training_days <= 0:
         raise ValueError("training_days must be positive")
 
-    insufficient = {
-        key: len(set(group["valid_times"]))
-        for key, group in groups.items()
-        if len(set(group["valid_times"])) < training_days
+    available_dates = {
+        key: len(set(group["valid_times"])) for key, group in groups.items()
     }
+    if training_days is None:
+        insufficient = {
+            key: number_of_dates
+            for key, number_of_dates in available_dates.items()
+            if number_of_dates == 0
+        }
+    else:
+        insufficient = {
+            key: number_of_dates
+            for key, number_of_dates in available_dates.items()
+            if number_of_dates < training_days
+        }
     if insufficient and not skip_insufficient:
         details = ", ".join(
             f"{key}: {number_of_dates}"
             for key, number_of_dates in sorted(insufficient.items())
         )
+        required_dates = "at least one" if training_days is None else str(training_days)
         raise ValueError(
-            f"insufficient EMOS training data; need {training_days} dates per "
+            f"insufficient EMOS training data; need {required_dates} dates per "
             f"group ({details})"
         )
 
@@ -391,7 +409,9 @@ def train_grouped_ensemble_mos(
         )
         fits[key] = ensemble_mos(
             ensemble_data,
-            training_days=training_days,
+            training_days=(
+                available_dates[key] if training_days is None else training_days
+            ),
             consecutive=consecutive,
             control=control,
             warm_start=warm_start,
