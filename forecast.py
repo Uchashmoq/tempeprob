@@ -46,7 +46,7 @@ def save_forcast(fc, city_name, model_name):
         file.write("\n")
 
 
-def fc_eq(fc1, fc2):
+def _fc_eq(fc1, fc2):
     fc1c = {k: v for k, v in fc1.items() if k != "meta"}
     fc2c = {k: v for k, v in fc2.items() if k != "meta"}
     return fc1c == fc2c
@@ -69,7 +69,7 @@ def update_forecast(city, model):
         return False
 
     fc = data_source.ensemble_forcast(city["lat"], city["lon"], model)
-    if fc_eq(fc, lfc):
+    if _fc_eq(fc, lfc):
         logging.warning(
             "Forecast metadata changed but forecast data did not for %s", key
         )
