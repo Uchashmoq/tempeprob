@@ -122,6 +122,6 @@ pip install pandas requests numpy rpy2
 {
    "temperature":40,
    "time":1784109600,
-   "update_time":1784106000.0
+   "update_time":1784109700
 }
 ```
