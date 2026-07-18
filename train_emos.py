@@ -12,12 +12,20 @@ from rpy2.robjects import vectors
 from rpy2.robjects.packages import importr
 
 CELSIUS_TO_KELVIN = 273.15
+DEFAULT_DATA_DIR = Path("data")
 
 
-def load_forecast(city_name, model_name, rev=False) -> list[dict]:
-    path = Path("data/forecast") / city_name / model_name / "fc.jsonl"
+def load_forecast(
+    city_name: str,
+    model_name: str,
+    rev: bool = False,
+    *,
+    data_dir: str | Path = DEFAULT_DATA_DIR,
+) -> list[dict]:
+    """Load one city's model forecast history from a JSONL data directory."""
+    path = Path(data_dir) / "forecast" / city_name / model_name / "fc.jsonl"
     with path.open("r", encoding="utf-8") as forecast_file:
-        forecasts = [json.loads(line) for line in forecast_file]
+        forecasts = [json.loads(line) for line in forecast_file if line.strip()]
     forecasts.sort(
         key=lambda forecast: forecast["meta"]["last_run_initialisation_time"],
         reverse=rev,
@@ -25,10 +33,18 @@ def load_forecast(city_name, model_name, rev=False) -> list[dict]:
     return forecasts
 
 
-def load_temperature(city_name, rev=False) -> list[dict]:
-    path = Path("data/temperature") / city_name / "tem.jsonl"
+def load_temperature(
+    city_name: str,
+    rev: bool = False,
+    *,
+    data_dir: str | Path = DEFAULT_DATA_DIR,
+) -> list[dict]:
+    """Load one city's observed temperature history from a JSONL data directory."""
+    path = Path(data_dir) / "temperature" / city_name / "tem.jsonl"
     with path.open("r", encoding="utf-8") as temperature_file:
-        temperatures = [json.loads(line) for line in temperature_file]
+        temperatures = [
+            json.loads(line) for line in temperature_file if line.strip()
+        ]
     temperatures.sort(key=lambda temperature: temperature["time"], reverse=rev)
     return temperatures
 
@@ -414,3 +430,59 @@ def train_grouped_ensemble_mos(
         )
 
     return fits
+
+
+def train_ensemble_mos(
+    city_name: str,
+    model_name: str,
+    *,
+    data_dir: str | Path = DEFAULT_DATA_DIR,
+    training_days: int | None = None,
+    lead_step_hours: int | None = None,
+    max_lead_hours: int | None = 96,
+    require_available_before_valid: bool = True,
+    input_unit: str = "celsius",
+    exchangeable: bool | list[str] | tuple[str, ...] = True,
+    consecutive: bool = False,
+    control: Any | None = None,
+    warm_start: bool = False,
+    skip_insufficient: bool = False,
+) -> dict[tuple[str, int], Any]:
+    """Load one city/model dataset, group its cases, and train EMOS models.
+
+    ``data_dir`` must contain ``forecast/<city>/<model>/fc.jsonl`` and
+    ``temperature/<city>/tem.jsonl``.  It defaults to the project's ``data``
+    directory; tests and callers can point it at another directory such as
+    ``test-data/data2``.
+    """
+    forecasts = load_forecast(
+        city_name,
+        model_name,
+        data_dir=data_dir,
+    )
+    temperatures = load_temperature(
+        city_name,
+        data_dir=data_dir,
+    )
+    groups = group_emos_training_data(
+        forecasts,
+        temperatures,
+        lead_step_hours=lead_step_hours,
+        max_lead_hours=max_lead_hours,
+        require_available_before_valid=require_available_before_valid,
+    )
+    if not groups:
+        raise ValueError(
+            f"no matching EMOS training cases for {city_name}/{model_name}"
+        )
+
+    return train_grouped_ensemble_mos(
+        groups,
+        training_days=training_days,
+        input_unit=input_unit,
+        exchangeable=exchangeable,
+        consecutive=consecutive,
+        control=control,
+        warm_start=warm_start,
+        skip_insufficient=skip_insufficient,
+    )
