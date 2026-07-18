@@ -108,14 +108,9 @@ def group_emos_training_data(
     if max_lead_hours is not None and max_lead_hours < 0:
         raise ValueError("max_lead_hours must be non-negative")
 
-    observations_by_time: dict[int, float] = {}
-    for temperature in sorted(
-        temperatures,
-        key=lambda item: item["time"],
-    ):
-        observations_by_time[int(temperature["time"])] = float(
-            temperature["temperature"]
-        )
+    observations_by_time = {
+        int(item["time"]): float(item["temperature"]) for item in temperatures
+    }
 
     groups: dict[tuple[str, int], dict[str, Any]] = {}
     seen_cases: set[tuple[int, int]] = set()
