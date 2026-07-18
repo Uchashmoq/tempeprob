@@ -195,6 +195,32 @@ class EnsembleMosTest(unittest.TestCase):
             ("temperature_2m", "temperature_2m_member01"),
         )
 
+    def test_group_emos_training_data_defaults_to_96_hour_maximum_lead(self):
+        initialization_time = int(
+            datetime(2026, 7, 15, tzinfo=timezone.utc).timestamp()
+        )
+        valid_time_96h = initialization_time + 96 * 3600
+        valid_time_97h = initialization_time + 97 * 3600
+        forecasts = [
+            {
+                "time": [valid_time_96h, valid_time_97h],
+                "temperature_2m": [30.0, 31.0],
+                "temperature_2m_member01": [29.0, 30.0],
+                "meta": {
+                    "last_run_initialisation_time": initialization_time,
+                    "last_run_availability_time": initialization_time + 3600,
+                },
+            }
+        ]
+        temperatures = [
+            {"time": valid_time_96h, "temperature": 32.0},
+            {"time": valid_time_97h, "temperature": 33.0},
+        ]
+
+        groups = group_emos_training_data(forecasts, temperatures)
+
+        self.assertEqual(set(groups), {("00", 96)})
+
     def test_ensemble_mos_runs_with_mock_temperature_data(self):
         ensemble_data, dates = make_mock_ensemble_data()
 

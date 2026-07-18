@@ -85,6 +85,7 @@ def group_emos_training_data(
     temperatures: list[dict],
     *,
     lead_step_hours: int | None = None,
+    max_lead_hours: int | None = 96,
     require_available_before_valid: bool = True,
 ) -> dict[tuple[str, int], dict[str, Any]]:
     """Join forecasts to observations and group homogeneous EMOS cases.
@@ -99,9 +100,13 @@ def group_emos_training_data(
 
     Set ``lead_step_hours=6`` to retain only the native six-hourly AIFS lead
     times; leave it as ``None`` to retain Open-Meteo's interpolated hours too.
+    Leads greater than ``max_lead_hours`` are discarded; pass ``None`` to
+    disable the default 96-hour upper limit.
     """
     if lead_step_hours is not None and lead_step_hours <= 0:
         raise ValueError("lead_step_hours must be positive")
+    if max_lead_hours is not None and max_lead_hours < 0:
+        raise ValueError("max_lead_hours must be non-negative")
 
     observations_by_time = {
         int(item["time"]): float(item["temperature"]) for item in temperatures
@@ -153,6 +158,8 @@ def group_emos_training_data(
             if lead_seconds < 0 or lead_seconds % 3600 != 0:
                 continue
             lead_hour = lead_seconds // 3600
+            if max_lead_hours is not None and lead_hour > max_lead_hours:
+                continue
             if lead_step_hours is not None and lead_hour % lead_step_hours != 0:
                 continue
             if require_available_before_valid and availability_time > valid_time:
