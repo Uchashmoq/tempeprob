@@ -259,7 +259,10 @@ class EnsembleMosTest(unittest.TestCase):
         group_48h["forecast_hour"] = 48
         groups = {("00", 24): group_24h, ("00", 48): group_48h}
 
-        with patch("train.ensemble_mos", side_effect=("fit24", "fit48")) as fit:
+        with patch(
+            "train_emos.ensemble_mos",
+            side_effect=("fit24", "fit48"),
+        ) as fit:
             fits = train_grouped_ensemble_mos(groups, training_days=None)
 
         self.assertEqual(fits, {("00", 24): "fit24", ("00", 48): "fit48"})
@@ -287,7 +290,7 @@ class EnsembleMosTest(unittest.TestCase):
         expected_fits = {("00", 24): "fit"}
 
         with patch(
-            "train.train_grouped_ensemble_mos",
+            "train_emos.train_grouped_ensemble_mos",
             return_value=expected_fits,
         ) as grouped_train:
             fits = train_ensemble_mos(
