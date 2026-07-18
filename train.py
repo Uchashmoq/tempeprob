@@ -354,8 +354,7 @@ def train_grouped_ensemble_mos(
     distinct valid dates.  Set ``skip_insufficient=True`` to ignore groups that
     have not accumulated enough history yet.
     """
-    if not isinstance(training_days, int) or isinstance(training_days, bool):
-        raise TypeError("training_days must be an integer")
+
     if training_days <= 0:
         raise ValueError("training_days must be positive")
 
