@@ -3,19 +3,23 @@
 import math
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from rpy2 import robjects
 from rpy2.robjects import vectors
 from rpy2.robjects.packages import importr
 
-from train import (
+from train_emos import (
     build_temperature_ensemble_data,
     ensemble_mos,
     group_emos_training_data,
     match_forecast,
+    train_ensemble_mos,
     train_grouped_ensemble_mos,
 )
+
+TEST_DATA_DIR = Path(__file__).resolve().parents[1] / "test-data" / "data2"
 
 
 def make_mock_ensemble_data(number_of_days: int = 20):
@@ -86,9 +90,7 @@ def make_mock_group(number_of_days: int = 20):
 
 class EnsembleMosTest(unittest.TestCase):
     def test_build_temperature_ensemble_data_converts_celsius_to_kelvin(self):
-        timestamp = int(
-            datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
-        )
+        timestamp = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
         group = {
             "initialization_time": "00",
             "forecast_hour": 24,
@@ -280,6 +282,77 @@ class EnsembleMosTest(unittest.TestCase):
             ),
             {},
         )
+
+    def test_train_ensemble_mos_loads_city_model_from_data_directory(self):
+        expected_fits = {("00", 24): "fit"}
+
+        with patch(
+            "train.train_grouped_ensemble_mos",
+            return_value=expected_fits,
+        ) as grouped_train:
+            fits = train_ensemble_mos(
+                "Wuhan-ZHHH",
+                "ecmwf_aifs025_ensemble",
+                data_dir=TEST_DATA_DIR,
+                lead_step_hours=6,
+                max_lead_hours=48,
+                warm_start=True,
+            )
+
+        self.assertEqual(fits, expected_fits)
+        groups = grouped_train.call_args.args[0]
+        self.assertTrue(groups)
+        self.assertTrue(all(lead <= 48 for _, lead in groups))
+        self.assertTrue(
+            all("temperature_2m" in group["member_names"] for group in groups.values())
+        )
+        self.assertIsNone(grouped_train.call_args.kwargs["training_days"])
+        self.assertTrue(grouped_train.call_args.kwargs["warm_start"])
+
+    def test_train_ensemble_mos_fits_chongqing_data_and_prints_result(self):
+        """Smoke-test a real R fit; three dates are not enough for production."""
+        fits = train_ensemble_mos(
+            "Chongqing-ZUCK",
+            "ecmwf_aifs025_ensemble",
+            data_dir=TEST_DATA_DIR,
+            training_days=3,
+            lead_step_hours=6,
+            max_lead_hours=12,
+            skip_insufficient=True,
+        )
+
+        self.assertEqual(set(fits), {("00", 12), ("06", 12), ("12", 12)})
+        for key, fit in sorted(fits.items()):
+            result_classes = set(robjects.r["class"](fit))  # type: ignore
+            self.assertIn("ensembleMOSnormal", result_classes)
+
+            training = fit.rx2("training")
+            a = fit.rx2("a")
+            coefficients = fit.rx2("B")
+            c = fit.rx2("c")
+            d = fit.rx2("d")
+            for parameter in (a, coefficients, c, d):
+                self.assertTrue(all(math.isfinite(float(value)) for value in parameter))
+
+            member_names = list(coefficients.rownames)
+            coefficient_values = list(coefficients)
+            coefficient_by_member = dict(zip(member_names, coefficient_values))
+            print(
+                "\nChongqing EMOS fit:",
+                {
+                    "group": key,
+                    "model_date": list(a.colnames)[-1],
+                    "training_days": int(training[0]),
+                    "training_cases": int(training[-1]),
+                    "a": float(a[-1]),
+                    "B_control": float(coefficient_by_member["temperature_2m"]),
+                    "B_perturbed_member": float(
+                        coefficient_by_member["temperature_2m_member01"]
+                    ),
+                    "c": float(c[-1]),
+                    "d": float(d[-1]),
+                },
+            )
 
 
 if __name__ == "__main__":
