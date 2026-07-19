@@ -9,17 +9,18 @@ during the same local day.
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+import json
 from math import isfinite
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 DailyMaxGroupKey = tuple[str, int]
+DATA_DIR = Path("data")
 
 __all__ = [
     "DailyMaxGroupKey",
     "group_daily_max_temperature_emos_training_data",
-    "group_daily_max_emos_training_data",
-    "group_max_temperature_emos_training_data",
 ]
 
 
@@ -132,13 +133,14 @@ def _group_observations_by_local_date(
 
     If a timestamp was stored more than once, the record with the latest
     ``update_time`` is treated as the final observation.
+    {date:[(timestamp,temperature)]}
     """
     latest_by_time: dict[int, tuple[float, int, float]] = {}
     for position, item in enumerate(temperatures):
         try:
             timestamp = int(item["time"])
             temperature = float(item["temperature"])
-            update_time = float(item.get("update_time", position))
+            update_time = float(item["update_time"])
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("invalid temperature observation") from error
 
@@ -201,9 +203,7 @@ def _validate_forecast_arrays(
         raise ValueError("forecast timestamps must be integers") from error
     if len(set(timestamps)) != len(timestamps):
         raise ValueError("forecast contains duplicate timestamps")
-    return timestamps, {
-        timestamp: index for index, timestamp in enumerate(timestamps)
-    }
+    return timestamps, {timestamp: index for index, timestamp in enumerate(timestamps)}
 
 
 def _daily_member_maxima(
@@ -245,7 +245,10 @@ def _prepare_forecast_run(
     if model_name is not None and not isinstance(model_name, str):
         raise ValueError("forecast model must be a string")
 
-    member_names = _temperature_member_names(forecast)
+    member_names = _temperature_member_names(
+        forecast
+    )  # [temperature_2m, temperature_2m_member01
+    #           {timestamp: index}
     timestamps, index_by_time = _validate_forecast_arrays(
         forecast,
         member_names,
@@ -415,6 +418,62 @@ def _sort_parallel_group_fields(group: dict[str, Any]) -> None:
         group[field_name] = [group[field_name][index] for index in order]
 
 
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Load non-empty JSONL lines and require one JSON object per line."""
+    records: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as jsonl_file:
+        for line_number, line in enumerate(jsonl_file, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"invalid JSON in {path} at line {line_number}"
+                ) from error
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"expected a JSON object in {path} at line {line_number}"
+                )
+            records.append(record)
+    return records
+
+
+def _load_forecasts(
+    city_name: str,
+    model_name: str,
+) -> list[dict[str, Any]]:
+    """Load one city's model forecast records from the default data folder."""
+    path = DATA_DIR / "forecast" / city_name / model_name / "fc.jsonl"
+    forecasts = _load_jsonl(path)
+    try:
+        forecasts.sort(
+            key=lambda forecast: (
+                int(forecast["meta"]["last_run_initialisation_time"]),
+                int(forecast["meta"]["last_run_availability_time"]),
+            )
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"invalid forecast metadata in {path}") from error
+    return forecasts
+
+
+def _load_temperatures(city_name: str) -> list[dict[str, Any]]:
+    """Load one city's hourly temperature observations from the data folder."""
+    path = DATA_DIR / "temperature" / city_name / "tem.jsonl"
+    temperatures = _load_jsonl(path)
+    try:
+        temperatures.sort(
+            key=lambda observation: (
+                int(observation["time"]),
+                float(observation["update_time"]),
+            )
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"invalid temperature observation in {path}") from error
+    return temperatures
+
+
 def group_daily_max_temperature_emos_training_data(
     forecasts: list[dict[str, Any]],
     temperatures: list[dict[str, Any]],
@@ -451,7 +510,7 @@ def group_daily_max_temperature_emos_training_data(
         raise ValueError("minimum_notice_hours must be non-negative")
     if max_day_ahead is not None and max_day_ahead < 0:
         raise ValueError("max_day_ahead must be non-negative")
-
+    # {date:[(timestamp,temperature)]}
     observations_by_date = _group_observations_by_local_date(
         temperatures,
         city_timezone,
@@ -512,12 +571,3 @@ def group_daily_max_temperature_emos_training_data(
     for group in groups.values():
         _sort_parallel_group_fields(group)
     return groups
-
-
-# Shorter alias for callers that already know the target variable is temperature.
-group_daily_max_emos_training_data = (
-    group_daily_max_temperature_emos_training_data
-)
-group_max_temperature_emos_training_data = (
-    group_daily_max_temperature_emos_training_data
-)
