@@ -125,3 +125,61 @@ pip install pandas requests numpy rpy2
    "update_time":1784109700
 }
 ```
+
+### group
+```json
+{
+    "initialization_hour": "00",
+    "initialization_time": "00",
+    "day_ahead": 1,
+    "model": "ecmwf_aifs025_ensemble",
+    "timezone": "Asia/Shanghai",
+    "member_names": (
+        "temperature_2m",
+        "temperature_2m_member01",
+        "temperature_2m_member02",
+    ),
+    "expected_interval_seconds": 3600,
+
+    "target_dates": [
+        "2026-07-16",
+        "2026-07-17",
+    ],
+    "target_day_start_times": [
+        1784131200,
+        1784217600,
+    ],
+    "target_day_end_times": [
+        1784217600,
+        1784304000,
+    ],
+    "initialization_times": [
+        1784073600,
+        1784160000,
+    ],
+    "availability_times": [
+        1784100444,
+        1784187584,
+    ],
+    "forecasts": [
+        (36.2, 37.1, 35.8), highest temperature of every member
+        (34.5, 35.3, 34.9),
+    ],
+    "observations": [
+        40.0,
+        34.0,
+    ],
+    "forecast_counts": [
+        24,
+        24,
+    ],
+    "observation_counts": [
+        24,
+        24,
+    ],
+    "observation_coverages": [
+        1.0,
+        1.0,
+    ],
+}
+```
