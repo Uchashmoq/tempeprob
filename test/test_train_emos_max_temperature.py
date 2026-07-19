@@ -1,6 +1,7 @@
 """Tests for daily maximum-temperature EMOS case preparation."""
 
 import json
+import math
 import unittest
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -10,7 +11,9 @@ from zoneinfo import ZoneInfo
 from train_emos_max_temperature import (
     _load_forecasts,
     _load_temperatures,
+    build_daily_max_temperature_ensemble_data,
     group_daily_max_temperature_emos_training_data,
+    train_daily_max_temperature_emos,
 )
 
 
@@ -61,7 +64,155 @@ def load_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in jsonl_file if line.strip()]
 
 
+def make_daily_max_group(
+    number_of_days: int,
+    *,
+    initialization_time: str = "00",
+    day_ahead: int = 1,
+) -> dict:
+    """Build deterministic grouped daily maxima for EMOS bridge tests."""
+    target_start = date(2026, 1, 1)
+    forecasts = []
+    observations = []
+    for index in range(number_of_days):
+        temperature = 20.0 + 0.12 * index + 1.7 * math.sin(index / 3)
+        forecasts.append(
+            (
+                temperature - 0.8 + 0.2 * math.cos(index),
+                temperature + 0.6,
+                temperature + 0.15 * math.sin(index / 2),
+            )
+        )
+        observations.append(temperature + 0.3 * math.cos(index * 1.4))
+
+    return {
+        "initialization_time": initialization_time,
+        "initialization_hour": initialization_time,
+        "day_ahead": day_ahead,
+        "member_names": (
+            "temperature_2m",
+            "temperature_2m_member01",
+            "temperature_2m_member02",
+        ),
+        "target_dates": [
+            (target_start + timedelta(days=index)).isoformat()
+            for index in range(number_of_days)
+        ],
+        "forecasts": forecasts,
+        "observations": observations,
+    }
+
+
 class DailyMaxTemperatureGroupingTest(unittest.TestCase):
+    def test_build_daily_max_ensemble_data_converts_celsius_to_kelvin(self):
+        group = {
+            "initialization_time": "06",
+            "day_ahead": 2,
+            "member_names": (
+                "temperature_2m",
+                "temperature_2m_member01",
+            ),
+            "target_dates": ["2026-01-01"],
+            "forecasts": [(0.0, 1.0)],
+            "observations": [0.5],
+        }
+
+        ensemble_data = build_daily_max_temperature_ensemble_data(group)
+
+        from rpy2.robjects.packages import importr
+
+        ensemble_bma = importr("ensembleBMA")
+        self.assertEqual(
+            list(ensemble_bma.ensembleForecasts(ensemble_data)),
+            [273.15, 274.15],
+        )
+        self.assertEqual(
+            list(ensemble_bma.dataVerifObs(ensemble_data)),
+            [273.65],
+        )
+        self.assertEqual(
+            list(ensemble_bma.ensembleValidDates(ensemble_data)),
+            ["20260101"],
+        )
+        self.assertEqual(list(ensemble_bma.ensembleFhour(ensemble_data)), [48])
+        self.assertEqual(list(ensemble_bma.ensembleItime(ensemble_data)), ["06"])
+        self.assertEqual(
+            list(ensemble_bma.ensembleGroups(ensemble_data)),
+            ["control", "perturbed"],
+        )
+
+    def test_train_daily_max_emos_adapts_window_per_group(self):
+        groups = {
+            ("00", 1): make_daily_max_group(5),
+            ("06", 2): make_daily_max_group(
+                8,
+                initialization_time="06",
+                day_ahead=2,
+            ),
+        }
+
+        with (
+            patch(
+                "train_emos_max_temperature."
+                "build_daily_max_temperature_ensemble_data",
+                side_effect=("data00", "data06"),
+            ),
+            patch(
+                "train_emos_max_temperature._call_daily_max_ensemble_mos",
+                side_effect=("fit00", "fit06"),
+            ) as fit,
+        ):
+            fits = train_daily_max_temperature_emos(groups)
+
+        self.assertEqual(fits, {("00", 1): "fit00", ("06", 2): "fit06"})
+        self.assertEqual(
+            [call.args[1] for call in fit.call_args_list],
+            [5, 8],
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["consecutive"] is False
+                for call in fit.call_args_list
+            )
+        )
+
+    def test_train_daily_max_emos_rejects_insufficient_groups(self):
+        groups = {("00", 1): make_daily_max_group(5)}
+
+        with self.assertRaisesRegex(ValueError, "need 6 dates"):
+            train_daily_max_temperature_emos(groups, training_days=6)
+
+        self.assertEqual(
+            train_daily_max_temperature_emos(
+                groups,
+                training_days=6,
+                skip_insufficient=True,
+            ),
+            {},
+        )
+
+    def test_train_daily_max_emos_runs_gaussian_r_fit(self):
+        from rpy2 import robjects
+
+        groups = {("00", 1): make_daily_max_group(20)}
+
+        fits = train_daily_max_temperature_emos(groups, training_days=14)
+
+        fit = fits[("00", 1)]
+        self.assertIn("ensembleMOSnormal", set(robjects.r["class"](fit)))
+        self.assertTrue({"training", "a", "B", "c", "d"}.issubset(fit.names))
+        for parameter_name in ("a", "B", "c", "d"):
+            self.assertTrue(
+                all(math.isfinite(float(value)) for value in fit.rx2(parameter_name))
+            )
+
+    def test_daily_max_ensemble_data_rejects_duplicate_dates(self):
+        group = make_daily_max_group(2)
+        group["target_dates"] = ["2026-01-01", "2026-01-01"]
+
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            build_daily_max_temperature_ensemble_data(group)
+
     def test_loads_forecasts_and_temperatures_from_data_directory(self):
         with patch("train_emos_max_temperature.DATA_DIR", TEST_DATA_DIR):
             forecasts = _load_forecasts(
