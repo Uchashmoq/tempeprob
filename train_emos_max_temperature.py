@@ -20,7 +20,9 @@ DATA_DIR = Path("data")
 
 __all__ = [
     "DailyMaxGroupKey",
+    "build_daily_max_temperature_ensemble_data",
     "group_daily_max_temperature_emos_training_data",
+    "train_daily_max_temperature_emos",
 ]
 
 
@@ -48,6 +50,16 @@ class _DailyMaxCase:
     forecast_count: int
     observation_count: int
     observation_coverage: float
+
+
+@dataclass(frozen=True)
+class _DailyMaxTrainingGroup:
+    member_names: tuple[str, ...]
+    target_dates: tuple[str, ...]
+    forecasts: tuple[tuple[Any, ...], ...]
+    observations: tuple[Any, ...]
+    initialization_time: str
+    day_ahead: int
 
 
 def _temperature_member_names(forecast: dict[str, Any]) -> tuple[str, ...]:
@@ -571,3 +583,244 @@ def group_daily_max_temperature_emos_training_data(
     for group in groups.values():
         _sort_parallel_group_fields(group)
     return groups
+
+
+def _validate_daily_max_training_group(
+    group: dict[str, Any],
+) -> _DailyMaxTrainingGroup:
+    """Validate the parallel arrays required to construct ``ensembleData``."""
+    try:
+        member_names = tuple(group["member_names"])
+        raw_target_dates = list(group["target_dates"])
+        raw_forecasts = list(group["forecasts"])
+        observations = tuple(group["observations"])
+        initialization_time = str(group["initialization_time"])
+        raw_day_ahead = group["day_ahead"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("daily-max EMOS group is missing required fields") from error
+
+    if not member_names or not all(
+        isinstance(name, str) and name for name in member_names
+    ):
+        raise ValueError("daily-max EMOS group contains invalid member_names")
+    if len(set(member_names)) != len(member_names):
+        raise ValueError("daily-max EMOS member_names must be unique")
+    if not raw_forecasts:
+        raise ValueError("daily-max EMOS group contains no forecast cases")
+    if not (len(raw_target_dates) == len(raw_forecasts) == len(observations)):
+        raise ValueError("daily-max EMOS group fields have different case counts")
+
+    forecast_rows: list[tuple[Any, ...]] = []
+    for row in raw_forecasts:
+        try:
+            forecast_row = tuple(row)
+        except TypeError as error:
+            raise ValueError("daily-max forecast rows must be sequences") from error
+        if len(forecast_row) != len(member_names):
+            raise ValueError("daily-max forecast rows do not match member_names")
+        forecast_rows.append(forecast_row)
+
+    target_dates: list[str] = []
+    for raw_target_date in raw_target_dates:
+        if not isinstance(raw_target_date, str):
+            raise ValueError("daily-max target_dates must be ISO date strings")
+        try:
+            parsed_date = date.fromisoformat(raw_target_date)
+        except ValueError as error:
+            raise ValueError(
+                f"invalid daily-max target date: {raw_target_date!r}"
+            ) from error
+        if raw_target_date != parsed_date.isoformat():
+            raise ValueError("daily-max target_dates must use YYYY-MM-DD")
+        target_dates.append(parsed_date.strftime("%Y%m%d"))
+    if len(set(target_dates)) != len(target_dates):
+        raise ValueError("daily-max target_dates must be unique within a group")
+
+    if (
+        isinstance(raw_day_ahead, bool)
+        or not isinstance(raw_day_ahead, int)
+        or raw_day_ahead <= 0
+    ):
+        raise ValueError("daily-max day_ahead must be a positive integer")
+    if (
+        len(initialization_time) != 2
+        or not initialization_time.isdigit()
+        or not 0 <= int(initialization_time) <= 23
+    ):
+        raise ValueError("daily-max initialization_time must be an UTC hour 00-23")
+
+    return _DailyMaxTrainingGroup(
+        member_names=member_names,
+        target_dates=tuple(target_dates),
+        forecasts=tuple(forecast_rows),
+        observations=observations,
+        initialization_time=initialization_time,
+        day_ahead=raw_day_ahead,
+    )
+
+
+def build_daily_max_temperature_ensemble_data(
+    group: dict[str, Any],
+    *,
+    input_unit: str = "celsius",
+    exchangeable: bool | list[str] | tuple[str, ...] = True,
+) -> Any:
+    """Convert one daily-max group into an R ``ensembleData`` object.
+
+    Local target dates are passed in the official ``YYYYMMDD`` daily format.
+    ``forecastHour`` is the nominal daily-product horizon
+    ``day_ahead * 24``; ``ensembleMOS`` uses it to calculate the rolling-fit
+    lag.  Forecast and observed temperatures are both converted to Kelvin.
+    """
+    prepared = _validate_daily_max_training_group(group)
+
+    # Importing the R bridge only when training keeps JSONL grouping usable in
+    # environments that do not load R during preprocessing.
+    from rpy2 import robjects
+    from rpy2.robjects import vectors
+    from rpy2.robjects.packages import importr
+
+    from train_emos import (
+        _exchangeable_member_groups,
+        _temperature_to_kelvin,
+    )
+
+    forecast_values = [
+        _temperature_to_kelvin(value, input_unit)
+        for row in prepared.forecasts
+        for value in row
+    ]
+    observation_values = [
+        _temperature_to_kelvin(value, input_unit) for value in prepared.observations
+    ]
+
+    forecast_matrix = robjects.r["matrix"](
+        vectors.FloatVector(forecast_values),
+        nrow=len(prepared.forecasts),
+        ncol=len(prepared.member_names),
+        byrow=True,
+    )  # type: ignore
+    forecast_matrix.colnames = vectors.StrVector(prepared.member_names)
+
+    arguments: dict[str, Any] = {
+        "forecasts": forecast_matrix,
+        "dates": vectors.StrVector(prepared.target_dates),
+        "observations": vectors.FloatVector(observation_values),
+        "forecastHour": prepared.day_ahead * 24,
+        "initializationTime": prepared.initialization_time,
+    }
+    exchangeable_groups = _exchangeable_member_groups(
+        prepared.member_names,
+        exchangeable,
+    )
+    if exchangeable_groups is not None:
+        arguments["exchangeable"] = vectors.StrVector(exchangeable_groups)
+
+    ensemble_bma = importr("ensembleBMA")
+    return ensemble_bma.ensembleData(**arguments)
+
+
+def _call_daily_max_ensemble_mos(
+    ensemble_data: Any,
+    training_days: int,
+    *,
+    consecutive: bool,
+    control: Any | None,
+    warm_start: bool,
+) -> Any:
+    """Call the shared low-level wrapper with the Gaussian temperature model."""
+    from train_emos import ensemble_mos
+
+    return ensemble_mos(
+        ensemble_data,
+        training_days=training_days,
+        consecutive=consecutive,
+        control=control,
+        warm_start=warm_start,
+        model="normal",
+    )
+
+
+def train_daily_max_temperature_emos(
+    groups: dict[DailyMaxGroupKey, dict[str, Any]],
+    training_days: int | None = None,
+    *,
+    input_unit: str = "celsius",
+    exchangeable: bool | list[str] | tuple[str, ...] = True,
+    consecutive: bool = False,
+    control: Any | None = None,
+    warm_start: bool = False,
+    skip_insufficient: bool = False,
+) -> dict[DailyMaxGroupKey, Any]:
+    """Fit one rolling Gaussian ``ensembleMOS`` model per daily-max group.
+
+    The result maps ``(initialization_hour_utc, day_ahead)`` to the raw R
+    ``ensembleMOSnormal`` result.  With ``training_days=None``, each group uses
+    all of its distinct target dates as its own training-window length.  An
+    explicit window requires at least that many dates in every retained group.
+    """
+    if training_days is not None and (
+        isinstance(training_days, bool)
+        or not isinstance(training_days, int)
+        or training_days <= 0
+    ):
+        raise ValueError("training_days must be a positive integer or None")
+
+    prepared_groups: dict[DailyMaxGroupKey, _DailyMaxTrainingGroup] = {}
+    available_dates: dict[DailyMaxGroupKey, int] = {}
+    for key, group in groups.items():
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or not isinstance(key[0], str)
+            or isinstance(key[1], bool)
+            or not isinstance(key[1], int)
+        ):
+            raise ValueError(f"invalid daily-max EMOS group key: {key!r}")
+        prepared = _validate_daily_max_training_group(group)
+        if key != (prepared.initialization_time, prepared.day_ahead):
+            raise ValueError(f"daily-max group metadata does not match key {key!r}")
+        prepared_groups[key] = prepared
+        available_dates[key] = len(prepared.target_dates)
+
+    if training_days is None:
+        insufficient = {
+            key: count for key, count in available_dates.items() if count == 0
+        }
+    else:
+        insufficient = {
+            key: count
+            for key, count in available_dates.items()
+            if count < training_days
+        }
+
+    if insufficient and not skip_insufficient:
+        details = ", ".join(
+            f"{key}: {count}" for key, count in sorted(insufficient.items())
+        )
+        required = "at least one" if training_days is None else str(training_days)
+        raise ValueError(
+            f"insufficient daily-max EMOS data; need {required} dates per "
+            f"group ({details})"
+        )
+
+    fits: dict[DailyMaxGroupKey, Any] = {}
+    for key in sorted(prepared_groups):
+        if key in insufficient:
+            continue
+        ensemble_data = build_daily_max_temperature_ensemble_data(
+            groups[key],
+            input_unit=input_unit,
+            exchangeable=exchangeable,
+        )
+        group_training_days = (
+            available_dates[key] if training_days is None else training_days
+        )
+        fits[key] = _call_daily_max_ensemble_mos(
+            ensemble_data,
+            group_training_days,
+            consecutive=consecutive,
+            control=control,
+            warm_start=warm_start,
+        )
+    return fits
