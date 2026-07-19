@@ -4,9 +4,12 @@ import json
 import unittest
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from train_emos_max_temperature import (
+    _load_forecasts,
+    _load_temperatures,
     group_daily_max_temperature_emos_training_data,
 )
 
@@ -59,6 +62,30 @@ def load_jsonl(path: Path) -> list[dict]:
 
 
 class DailyMaxTemperatureGroupingTest(unittest.TestCase):
+    def test_loads_forecasts_and_temperatures_from_data_directory(self):
+        with patch("train_emos_max_temperature.DATA_DIR", TEST_DATA_DIR):
+            forecasts = _load_forecasts(
+                "Chongqing-ZUCK",
+                "ecmwf_aifs025_ensemble",
+            )
+            temperatures = _load_temperatures("Chongqing-ZUCK")
+
+        self.assertEqual(len(forecasts), 12)
+        self.assertEqual(len(temperatures), 67)
+        self.assertTrue(all(isinstance(item, dict) for item in forecasts))
+        self.assertTrue(all(isinstance(item, dict) for item in temperatures))
+        self.assertEqual(
+            [item["meta"]["last_run_initialisation_time"] for item in forecasts],
+            sorted(
+                item["meta"]["last_run_initialisation_time"]
+                for item in forecasts
+            ),
+        )
+        self.assertEqual(
+            [item["time"] for item in temperatures],
+            sorted(item["time"] for item in temperatures),
+        )
+
     def test_groups_one_complete_local_day_and_calculates_member_maxima(self):
         zone = ZoneInfo("Asia/Shanghai")
         target_date = date(2026, 7, 18)
