@@ -5,7 +5,8 @@ import math
 import unittest
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from tempfile import TemporaryDirectory
+from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
 from train_emos_max_temperature import (
@@ -13,6 +14,9 @@ from train_emos_max_temperature import (
     _load_temperatures,
     build_daily_max_temperature_ensemble_data,
     group_daily_max_temperature_emos_training_data,
+    load_daily_max_temperature_emos_fits,
+    save_daily_max_temperature_emos_fits,
+    train_all_daily_max_temperature_emos,
     train_daily_max_temperature_emos,
 )
 
@@ -205,6 +209,379 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
             self.assertTrue(
                 all(math.isfinite(float(value)) for value in fit.rx2(parameter_name))
             )
+
+        completed_at = datetime(2026, 7, 19, 1, 2, 3, tzinfo=timezone.utc)
+        with TemporaryDirectory() as output_dir:
+            first_path = save_daily_max_temperature_emos_fits(
+                fits,
+                groups,
+                "Chongqing-ZUCK",
+                "test_ensemble",
+                training_days=14,
+                training_completed_at=completed_at,
+                extra_metadata={"source": "unit-test"},
+                output_dir=output_dir,
+            )
+            second_path = save_daily_max_temperature_emos_fits(
+                fits,
+                groups,
+                "Chongqing-ZUCK",
+                "test_ensemble",
+                training_days=14,
+                training_completed_at=completed_at,
+                output_dir=output_dir,
+            )
+
+            self.assertNotEqual(first_path, second_path)
+            self.assertTrue(first_path.is_dir())
+            self.assertTrue(second_path.is_dir())
+
+            latest = load_daily_max_temperature_emos_fits(
+                "Chongqing-ZUCK",
+                "test_ensemble",
+                output_dir=output_dir,
+            )
+            historical = load_daily_max_temperature_emos_fits(
+                "Chongqing-ZUCK",
+                "test_ensemble",
+                version=first_path.name,
+                output_dir=output_dir,
+            )
+
+            self.assertEqual(latest.path, second_path)
+            self.assertEqual(historical.path, first_path)
+            self.assertTrue(
+                bool(robjects.r["identical"](fit, historical.fits[("00", 1)])[0])
+            )
+            manifest = historical.metadata
+            self.assertEqual(manifest["summary"]["fitted_sample_count"], 20)
+            self.assertEqual(manifest["groups"][0]["sample_count"], 20)
+            self.assertEqual(
+                manifest["groups"][0]["resolved_training_days"],
+                14,
+            )
+            self.assertEqual(manifest["groups"][0]["parameter_set_count"], 7)
+            self.assertEqual(
+                manifest["training_completed_at_utc"],
+                "2026-07-19T01:02:03.000000Z",
+            )
+            self.assertEqual(
+                manifest["extra_metadata"],
+                {"source": "unit-test"},
+            )
+
+            latest_fit_file = (
+                latest.path / latest.metadata["groups"][0]["fit_file"]
+            )
+            with latest_fit_file.open("ab") as output_file:
+                output_file.write(b"tampered")
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                load_daily_max_temperature_emos_fits(
+                    "Chongqing-ZUCK",
+                    "test_ensemble",
+                    output_dir=output_dir,
+                )
+
+    def test_daily_max_emos_storage_rejects_unsafe_categories(self):
+        with self.assertRaisesRegex(ValueError, "safe path component"):
+            save_daily_max_temperature_emos_fits(
+                {},
+                {},
+                "../Chongqing-ZUCK",
+                "test_ensemble",
+            )
+        with self.assertRaisesRegex(ValueError, "safe path component"):
+            load_daily_max_temperature_emos_fits(
+                "Chongqing-ZUCK",
+                "../test_ensemble",
+            )
+
+    def test_daily_max_emos_storage_does_not_publish_partial_version(self):
+        groups = {
+            ("00", 1): make_daily_max_group(2),
+            ("06", 1): make_daily_max_group(
+                2,
+                initialization_time="06",
+            ),
+        }
+        fits = {("00", 1): "fit00", ("06", 1): "fit06"}
+
+        def describe_fit(fit):
+            initialization_time = "00" if fit == "fit00" else "06"
+            return {
+                "fit_class": ["ensembleMOSnormal"],
+                "resolved_training_days": 2,
+                "lag_days": 1,
+                "training_case_counts": [2],
+                "forecast_hour": 24,
+                "initialization_time": initialization_time,
+                "modeled_dates": ["20260103"],
+                "parameter_set_count": 1,
+                "latest_parameter_date": "20260103",
+            }
+
+        def save_fit(fit, path):
+            if fit == "fit06":
+                raise RuntimeError("simulated RDS failure")
+            path.write_bytes(b"mock-rds")
+
+        with TemporaryDirectory() as output_dir:
+            with (
+                patch(
+                    "train_emos_max_temperature._describe_r_fit",
+                    side_effect=describe_fit,
+                ),
+                patch(
+                    "train_emos_max_temperature._save_r_fit",
+                    side_effect=save_fit,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated RDS failure"):
+                    save_daily_max_temperature_emos_fits(
+                        fits,
+                        groups,
+                        "Chongqing-ZUCK",
+                        "test_ensemble",
+                        training_days=2,
+                        output_dir=output_dir,
+                    )
+
+            model_directory = (
+                Path(output_dir) / "Chongqing-ZUCK" / "test_ensemble"
+            )
+            self.assertTrue(model_directory.is_dir())
+            self.assertEqual(list(model_directory.iterdir()), [])
+
+    def test_train_all_daily_max_emos_traverses_config_and_saves(self):
+        cities = [
+            {
+                "name": "City-One",
+                "timezone": "Asia/Shanghai",
+                "temp_unit": "C",
+                "models": [{"name": "model-a"}, {"name": "model-b"}],
+            },
+            {
+                "name": "City-Two",
+                "timezone": "Europe/Paris",
+                "temp_unit": "K",
+                "models": [{"name": "model-c"}],
+            },
+        ]
+        temperature_records = {
+            "City-One": [{"city": "City-One"}],
+            "City-Two": [{"city": "City-Two"}, {"city": "City-Two"}],
+        }
+
+        def load_temperatures(city_name, *, data_dir):
+            return temperature_records[city_name]
+
+        def load_forecasts(city_name, model_name, *, data_dir):
+            return [{"pair": (city_name, model_name)}]
+
+        def group_forecasts(forecasts, temperatures, city_timezone, **options):
+            return {
+                ("00", 1): {
+                    "pair": forecasts[0]["pair"],
+                    "temperature_count": len(temperatures),
+                    "timezone": city_timezone.key,
+                    "options": options,
+                }
+            }
+
+        def train_groups(groups, **options):
+            return {("00", 1): (groups[("00", 1)]["pair"], options)}
+
+        def save_fits(fits, groups, city_name, model_name, **options):
+            return Path(options["output_dir"]) / city_name / model_name / "version"
+
+        with (
+            patch("config.CITY", cities),
+            patch(
+                "train_emos_max_temperature._load_temperatures",
+                side_effect=load_temperatures,
+            ) as temperature_loader,
+            patch(
+                "train_emos_max_temperature._load_forecasts",
+                side_effect=load_forecasts,
+            ) as forecast_loader,
+            patch(
+                "train_emos_max_temperature."
+                "group_daily_max_temperature_emos_training_data",
+                side_effect=group_forecasts,
+            ) as grouper,
+            patch(
+                "train_emos_max_temperature.train_daily_max_temperature_emos",
+                side_effect=train_groups,
+            ) as trainer,
+            patch(
+                "train_emos_max_temperature."
+                "save_daily_max_temperature_emos_fits",
+                side_effect=save_fits,
+            ) as saver,
+        ):
+            artifacts = train_all_daily_max_temperature_emos(
+                data_dir="input-data",
+                output_dir="output-models",
+                training_days=30,
+                expected_interval_seconds=3600,
+                minimum_observation_coverage=0.8,
+                minimum_notice_hours=9.0,
+                max_day_ahead=4,
+                exchangeable=False,
+                consecutive=True,
+                control="custom-control",
+                warm_start=True,
+                skip_insufficient=True,
+                extra_metadata={"run": "nightly"},
+            )
+
+        self.assertEqual(
+            artifacts,
+            {
+                ("City-One", "model-a"): Path(
+                    "output-models/City-One/model-a/version"
+                ),
+                ("City-One", "model-b"): Path(
+                    "output-models/City-One/model-b/version"
+                ),
+                ("City-Two", "model-c"): Path(
+                    "output-models/City-Two/model-c/version"
+                ),
+            },
+        )
+        self.assertEqual(
+            temperature_loader.call_args_list,
+            [
+                call("City-One", data_dir=Path("input-data")),
+                call("City-Two", data_dir=Path("input-data")),
+            ],
+        )
+        self.assertEqual(
+            forecast_loader.call_args_list,
+            [
+                call("City-One", "model-a", data_dir=Path("input-data")),
+                call("City-One", "model-b", data_dir=Path("input-data")),
+                call("City-Two", "model-c", data_dir=Path("input-data")),
+            ],
+        )
+        self.assertEqual(grouper.call_count, 3)
+        self.assertEqual(trainer.call_count, 3)
+        self.assertEqual(saver.call_count, 3)
+        self.assertEqual(
+            [
+                training_call.kwargs["input_unit"]
+                for training_call in trainer.call_args_list
+            ],
+            ["celsius", "celsius", "kelvin"],
+        )
+        for save_call in saver.call_args_list:
+            self.assertEqual(save_call.kwargs["training_days"], 30)
+            self.assertEqual(save_call.kwargs["output_dir"], "output-models")
+            self.assertEqual(save_call.kwargs["extra_metadata"]["run"], "nightly")
+            self.assertIs(
+                save_call.kwargs["training_completed_at"].tzinfo,
+                timezone.utc,
+            )
+            batch_metadata = save_call.kwargs["extra_metadata"]["batch_training"]
+            self.assertEqual(batch_metadata["data_directory"], "input-data")
+            self.assertEqual(
+                batch_metadata["grouping_options"]["minimum_notice_hours"],
+                9.0,
+            )
+            self.assertTrue(batch_metadata["custom_control_supplied"])
+
+    def test_train_all_daily_max_emos_rejects_empty_pipeline_results(self):
+        city = {
+            "name": "City-One",
+            "timezone": "Asia/Shanghai",
+            "temp_unit": "C",
+            "models": [{"name": "model-a"}],
+        }
+        with (
+            patch(
+                "train_emos_max_temperature._load_temperatures",
+                return_value=[{"observation": 1}],
+            ),
+            patch(
+                "train_emos_max_temperature._load_forecasts",
+                return_value=[{"forecast": 1}],
+            ),
+            patch(
+                "train_emos_max_temperature."
+                "group_daily_max_temperature_emos_training_data",
+                return_value={},
+            ),
+            patch(
+                "train_emos_max_temperature.train_daily_max_temperature_emos"
+            ) as trainer,
+            patch(
+                "train_emos_max_temperature."
+                "save_daily_max_temperature_emos_fits"
+            ) as saver,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "no daily-max EMOS training groups for City-One/model-a",
+            ):
+                train_all_daily_max_temperature_emos(cities=[city])
+        trainer.assert_not_called()
+        saver.assert_not_called()
+
+        with (
+            patch(
+                "train_emos_max_temperature._load_temperatures",
+                return_value=[{"observation": 1}],
+            ),
+            patch(
+                "train_emos_max_temperature._load_forecasts",
+                return_value=[{"forecast": 1}],
+            ),
+            patch(
+                "train_emos_max_temperature."
+                "group_daily_max_temperature_emos_training_data",
+                return_value={("00", 1): {"group": 1}},
+            ),
+            patch(
+                "train_emos_max_temperature.train_daily_max_temperature_emos",
+                return_value={},
+            ),
+            patch(
+                "train_emos_max_temperature."
+                "save_daily_max_temperature_emos_fits"
+            ) as saver,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "no daily-max EMOS fits produced for City-One/model-a",
+            ):
+                train_all_daily_max_temperature_emos(
+                    cities=[city],
+                    skip_insufficient=True,
+                )
+        saver.assert_not_called()
+
+    def test_train_all_daily_max_emos_validates_config_before_loading(self):
+        duplicate_models = [
+            {
+                "name": "City-One",
+                "timezone": "Asia/Shanghai",
+                "models": [{"name": "model-a"}, {"name": "model-a"}],
+            }
+        ]
+        with patch("train_emos_max_temperature._load_temperatures") as loader:
+            with self.assertRaisesRegex(ValueError, "duplicate city/model"):
+                train_all_daily_max_temperature_emos(cities=duplicate_models)
+        loader.assert_not_called()
+
+        invalid_timezone = [
+            {
+                "name": "City-One",
+                "timezone": "Not/A-Timezone",
+                "models": [{"name": "model-a"}],
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "unknown timezone"):
+            train_all_daily_max_temperature_emos(cities=invalid_timezone)
 
     def test_daily_max_ensemble_data_rejects_duplicate_dates(self):
         group = make_daily_max_group(2)
