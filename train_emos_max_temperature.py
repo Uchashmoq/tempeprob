@@ -12,6 +12,7 @@ from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 from importlib.metadata import version as package_version
 import json
+import logging
 from math import isfinite
 import os
 from pathlib import Path
@@ -26,16 +27,20 @@ DailyMaxGroupKey = tuple[str, int]
 DATA_DIR = Path("data")
 HIGHEST_TEMPERATURE_EMOS_DIR = Path("train/highest_temperature_emos")
 EMOS_ARTIFACT_SCHEMA_VERSION = 1
+DEFAULT_MINIMUM_TRAINING_DAYS = 10
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DailyMaxTemperatureEmosArtifact",
     "DailyMaxGroupKey",
-    "build_daily_max_temperature_ensemble_data",
-    "group_daily_max_temperature_emos_training_data",
-    "load_daily_max_temperature_emos_fits",
-    "save_daily_max_temperature_emos_fits",
+    "DEFAULT_MINIMUM_TRAINING_DAYS",
     "train_all_daily_max_temperature_emos",
-    "train_daily_max_temperature_emos",
+    # "build_daily_max_temperature_ensemble_data",
+    # "group_daily_max_temperature_emos_training_data",
+    # "load_daily_max_temperature_emos_fits",
+    # "save_daily_max_temperature_emos_fits",
+    # "train_daily_max_temperature_emos",
 ]
 
 
@@ -784,12 +789,13 @@ def train_daily_max_temperature_emos(
     groups: dict[DailyMaxGroupKey, dict[str, Any]],
     training_days: int | None = None,
     *,
+    minimum_training_days: int = DEFAULT_MINIMUM_TRAINING_DAYS,
     input_unit: str = "celsius",
     exchangeable: bool | list[str] | tuple[str, ...] = True,
     consecutive: bool = False,
     control: Any | None = None,
     warm_start: bool = False,
-    skip_insufficient: bool = False,
+    skip_insufficient: bool = True,
 ) -> dict[DailyMaxGroupKey, Any]:
     """Fit one rolling Gaussian ``ensembleMOS`` model per daily-max group.
 
@@ -797,6 +803,8 @@ def train_daily_max_temperature_emos(
     ``ensembleMOSnormal`` result.  With ``training_days=None``, each group uses
     all of its distinct target dates as its own training-window length.  An
     explicit window requires at least that many dates in every retained group.
+    Groups below ``minimum_training_days`` are skipped with a warning by
+    default.  Set ``skip_insufficient=False`` to restore fail-fast behavior.
     """
     if training_days is not None and (
         isinstance(training_days, bool)
@@ -804,6 +812,14 @@ def train_daily_max_temperature_emos(
         or training_days <= 0
     ):
         raise ValueError("training_days must be a positive integer or None")
+    if (
+        isinstance(minimum_training_days, bool)
+        or not isinstance(minimum_training_days, int)
+        or minimum_training_days <= 0
+    ):
+        raise ValueError("minimum_training_days must be a positive integer")
+    if not isinstance(skip_insufficient, bool):
+        raise ValueError("skip_insufficient must be a boolean")
 
     prepared_groups: dict[DailyMaxGroupKey, _DailyMaxTrainingGroup] = {}
     available_dates: dict[DailyMaxGroupKey, int] = {}
@@ -822,25 +838,31 @@ def train_daily_max_temperature_emos(
         prepared_groups[key] = prepared
         available_dates[key] = len(prepared.target_dates)
 
-    if training_days is None:
-        insufficient = {
-            key: count for key, count in available_dates.items() if count == 0
-        }
-    else:
-        insufficient = {
-            key: count
-            for key, count in available_dates.items()
-            if count < training_days
-        }
+    required_training_dates = max(
+        minimum_training_days,
+        0 if training_days is None else training_days,
+    )
+    insufficient = {
+        key: count
+        for key, count in available_dates.items()
+        if count < required_training_dates
+    }
 
     if insufficient and not skip_insufficient:
         details = ", ".join(
             f"{key}: {count}" for key, count in sorted(insufficient.items())
         )
-        required = "at least one" if training_days is None else str(training_days)
         raise ValueError(
-            f"insufficient daily-max EMOS data; need {required} dates per "
-            f"group ({details})"
+            "insufficient daily-max EMOS data; need at least "
+            f"{required_training_dates} dates per group ({details})"
+        )
+    for key, count in sorted(insufficient.items()):
+        logger.warning(
+            "Skipping daily-max EMOS group %r: only %d training date(s); "
+            "need at least %d",
+            key,
+            count,
+            required_training_dates,
         )
 
     fits: dict[DailyMaxGroupKey, Any] = {}
@@ -1041,11 +1063,12 @@ def save_daily_max_temperature_emos_fits(
     model_name: str,
     *,
     training_days: int | None = None,
+    minimum_training_days: int = DEFAULT_MINIMUM_TRAINING_DAYS,
     input_unit: str = "celsius",
     exchangeable: bool | list[str] | tuple[str, ...] = True,
     consecutive: bool = False,
     warm_start: bool = False,
-    skip_insufficient: bool = False,
+    skip_insufficient: bool = True,
     training_completed_at: datetime | None = None,
     extra_metadata: dict[str, Any] | None = None,
     output_dir: str | Path = HIGHEST_TEMPERATURE_EMOS_DIR,
@@ -1067,6 +1090,12 @@ def save_daily_max_temperature_emos_fits(
         or training_days <= 0
     ):
         raise ValueError("training_days must be a positive integer or None")
+    if (
+        isinstance(minimum_training_days, bool)
+        or not isinstance(minimum_training_days, int)
+        or minimum_training_days <= 0
+    ):
+        raise ValueError("minimum_training_days must be a positive integer")
     normalized_input_unit = input_unit.lower()
     if normalized_input_unit not in {"c", "celsius", "k", "kelvin"}:
         raise ValueError("input_unit must be 'celsius' or 'kelvin'")
@@ -1093,6 +1122,10 @@ def save_daily_max_temperature_emos_fits(
         exchangeable,
         "exchangeable",
     )
+    required_training_dates = max(
+        minimum_training_days,
+        0 if training_days is None else training_days,
+    )
 
     prepared_groups: dict[DailyMaxGroupKey, _DailyMaxTrainingGroup] = {}
     for key, group in groups.items():
@@ -1106,6 +1139,15 @@ def save_daily_max_temperature_emos_fits(
     if unknown_fit_keys:
         raise ValueError(
             f"fits have no matching source groups: {sorted(unknown_fit_keys)!r}"
+        )
+    underqualified_fit_keys = {
+        key: len(prepared_groups[key].target_dates)
+        for key in fits
+        if len(prepared_groups[key].target_dates) < required_training_dates
+    }
+    if underqualified_fit_keys:
+        raise ValueError(
+            "fits do not meet minimum training dates: " f"{underqualified_fit_keys!r}"
         )
 
     version = training_completed.strftime("%Y%m%dT%H%M%S.%fZ") + f"-{uuid4().hex[:12]}"
@@ -1172,6 +1214,8 @@ def save_daily_max_temperature_emos_fits(
                     "initialization_hour_utc": key[0],
                     "day_ahead": key[1],
                     "sample_count": len(prepared.target_dates),
+                    "reason": "insufficient_training_dates",
+                    "required_training_dates": required_training_dates,
                 }
             )
 
@@ -1188,6 +1232,7 @@ def save_daily_max_temperature_emos_fits(
             "runtime": _r_runtime_metadata(),
             "training_options": {
                 "requested_training_days": training_days,
+                "minimum_training_days": minimum_training_days,
                 "input_unit": normalized_input_unit,
                 "exchangeable": normalized_exchangeable,
                 "consecutive": consecutive,
@@ -1398,9 +1443,7 @@ def _prepare_daily_max_batch_cities(
         elif normalized_unit in {"k", "kelvin"}:
             normalized_unit = "kelvin"
         else:
-            raise ValueError(
-                f"city {city_name!r} temp_unit must be Celsius or Kelvin"
-            )
+            raise ValueError(f"city {city_name!r} temp_unit must be Celsius or Kelvin")
 
         if not isinstance(model_configs, (list, tuple)) or not model_configs:
             raise ValueError(f"city {city_name!r} must configure at least one model")
@@ -1440,6 +1483,7 @@ def train_all_daily_max_temperature_emos(
     data_dir: str | Path | None = None,
     output_dir: str | Path = HIGHEST_TEMPERATURE_EMOS_DIR,
     training_days: int | None = None,
+    minimum_training_days: int = DEFAULT_MINIMUM_TRAINING_DAYS,
     expected_interval_seconds: int = 3600,
     minimum_observation_coverage: float = 1.0,
     minimum_notice_hours: float = 0.0,
@@ -1449,7 +1493,7 @@ def train_all_daily_max_temperature_emos(
     consecutive: bool = False,
     control: Any | None = None,
     warm_start: bool = False,
-    skip_insufficient: bool = False,
+    skip_insufficient: bool = True,
     extra_metadata: dict[str, Any] | None = None,
 ) -> dict[tuple[str, str], Path]:
     """Train and version every configured city/model daily-max EMOS fit.
@@ -1457,11 +1501,20 @@ def train_all_daily_max_temperature_emos(
     With ``cities=None``, city names, timezones, temperature units, and model
     names are read from ``config.CITY`` at call time.  Temperature observations
     are loaded once per city, while forecasts are loaded separately for every
-    configured model.  The function is fail-fast and returns the new immutable
-    artifact directory for each ``(city_name, model_name)`` pair.
+    configured model.  Insufficient groups are skipped with warnings by
+    default; models with no remaining fit are also skipped.  Set
+    ``skip_insufficient=False`` for fail-fast behavior.
     """
     if extra_metadata is not None and not isinstance(extra_metadata, dict):
         raise ValueError("extra_metadata must be a dictionary or None")
+    if (
+        isinstance(minimum_training_days, bool)
+        or not isinstance(minimum_training_days, int)
+        or minimum_training_days <= 0
+    ):
+        raise ValueError("minimum_training_days must be a positive integer")
+    if not isinstance(skip_insufficient, bool):
+        raise ValueError("skip_insufficient must be a boolean")
     prepared_cities = _prepare_daily_max_batch_cities(cities, input_unit)
     source_directory = DATA_DIR if data_dir is None else Path(data_dir)
     artifact_paths: dict[tuple[str, str], Path] = {}
@@ -1487,14 +1540,18 @@ def train_all_daily_max_temperature_emos(
                 max_day_ahead=max_day_ahead,
             )
             if not groups:
-                raise ValueError(
-                    "no daily-max EMOS training groups for "
-                    f"{city.name}/{model_name}"
+                message = (
+                    "No daily-max EMOS training groups for " f"{city.name}/{model_name}"
                 )
+                if skip_insufficient:
+                    logger.warning("%s; skipping model", message)
+                    continue
+                raise ValueError(message)
 
             fits = train_daily_max_temperature_emos(
                 groups,
                 training_days=training_days,
+                minimum_training_days=minimum_training_days,
                 input_unit=city.input_unit,
                 exchangeable=exchangeable,
                 consecutive=consecutive,
@@ -1503,10 +1560,14 @@ def train_all_daily_max_temperature_emos(
                 skip_insufficient=skip_insufficient,
             )
             if not fits:
-                raise ValueError(
-                    "no daily-max EMOS fits produced for "
-                    f"{city.name}/{model_name}; all groups may be insufficient"
+                message = (
+                    "No daily-max EMOS fits produced for "
+                    f"{city.name}/{model_name}; all groups are insufficient"
                 )
+                if skip_insufficient:
+                    logger.warning("%s; skipping model", message)
+                    continue
+                raise ValueError(message)
 
             training_completed_at = datetime.now(timezone.utc)
             artifact_metadata = dict(extra_metadata or {})
@@ -1530,6 +1591,7 @@ def train_all_daily_max_temperature_emos(
                     city.name,
                     model_name,
                     training_days=training_days,
+                    minimum_training_days=minimum_training_days,
                     input_unit=city.input_unit,
                     exchangeable=exchangeable,
                     consecutive=consecutive,
@@ -1542,3 +1604,15 @@ def train_all_daily_max_temperature_emos(
             )
 
     return artifact_paths
+
+
+def main() -> dict[tuple[str, str], Path]:
+    """Train daily-maximum EMOS models for every city in config.CITY."""
+    artifact_paths = train_all_daily_max_temperature_emos(data_dir=DATA_DIR)
+    for (city_name, model_name), artifact_path in artifact_paths.items():
+        print(f"{city_name}/{model_name}: {artifact_path}")
+    return artifact_paths
+
+
+if __name__ == "__main__":
+    main()

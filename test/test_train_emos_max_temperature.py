@@ -10,6 +10,7 @@ from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
 from train_emos_max_temperature import (
+    DEFAULT_MINIMUM_TRAINING_DAYS,
     _load_forecasts,
     _load_temperatures,
     build_daily_max_temperature_ensemble_data,
@@ -19,7 +20,6 @@ from train_emos_max_temperature import (
     train_all_daily_max_temperature_emos,
     train_daily_max_temperature_emos,
 )
-
 
 TEST_DATA_DIR = Path(__file__).resolve().parents[1] / "test-data" / "data2"
 
@@ -147,9 +147,11 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
 
     def test_train_daily_max_emos_adapts_window_per_group(self):
         groups = {
-            ("00", 1): make_daily_max_group(5),
+            ("00", 1): make_daily_max_group(
+                DEFAULT_MINIMUM_TRAINING_DAYS
+            ),
             ("06", 2): make_daily_max_group(
-                8,
+                DEFAULT_MINIMUM_TRAINING_DAYS + 1,
                 initialization_time="06",
                 day_ahead=2,
             ),
@@ -171,29 +173,66 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
         self.assertEqual(fits, {("00", 1): "fit00", ("06", 2): "fit06"})
         self.assertEqual(
             [call.args[1] for call in fit.call_args_list],
-            [5, 8],
+            [
+                DEFAULT_MINIMUM_TRAINING_DAYS,
+                DEFAULT_MINIMUM_TRAINING_DAYS + 1,
+            ],
         )
         self.assertTrue(
-            all(
-                call.kwargs["consecutive"] is False
-                for call in fit.call_args_list
-            )
+            all(call.kwargs["consecutive"] is False for call in fit.call_args_list)
         )
 
-    def test_train_daily_max_emos_rejects_insufficient_groups(self):
-        groups = {("00", 1): make_daily_max_group(5)}
+    def test_train_daily_max_emos_skips_insufficient_groups_by_default(self):
+        insufficient_count = max(1, DEFAULT_MINIMUM_TRAINING_DAYS - 2)
+        sufficient_count = DEFAULT_MINIMUM_TRAINING_DAYS + 1
+        groups = {
+            ("00", 1): make_daily_max_group(insufficient_count),
+            ("06", 2): make_daily_max_group(
+                sufficient_count,
+                initialization_time="06",
+                day_ahead=2,
+            ),
+        }
 
-        with self.assertRaisesRegex(ValueError, "need 6 dates"):
-            train_daily_max_temperature_emos(groups, training_days=6)
+        with (
+            patch(
+                "train_emos_max_temperature."
+                "build_daily_max_temperature_ensemble_data",
+                return_value="data06",
+            ),
+            patch(
+                "train_emos_max_temperature._call_daily_max_ensemble_mos",
+                return_value="fit06",
+            ) as fit,
+            self.assertLogs(
+                "train_emos_max_temperature",
+                level="WARNING",
+            ) as warning_logs,
+        ):
+            fits = train_daily_max_temperature_emos(groups)
 
-        self.assertEqual(
+        self.assertEqual(fits, {("06", 2): "fit06"})
+        fit.assert_called_once()
+        self.assertEqual(fit.call_args.args[1], sufficient_count)
+        warning_text = "\n".join(warning_logs.output)
+        self.assertIn("('00', 1)", warning_text)
+        self.assertIn(
+            f"only {insufficient_count} training date(s)",
+            warning_text,
+        )
+        self.assertIn(
+            f"need at least {DEFAULT_MINIMUM_TRAINING_DAYS}",
+            warning_text,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            f"need at least {DEFAULT_MINIMUM_TRAINING_DAYS} dates",
+        ):
             train_daily_max_temperature_emos(
                 groups,
-                training_days=6,
-                skip_insufficient=True,
-            ),
-            {},
-        )
+                skip_insufficient=False,
+            )
 
     def test_train_daily_max_emos_runs_gaussian_r_fit(self):
         from rpy2 import robjects
@@ -203,18 +242,26 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
         fits = train_daily_max_temperature_emos(groups, training_days=14)
 
         fit = fits[("00", 1)]
-        self.assertIn("ensembleMOSnormal", set(robjects.r["class"](fit)))
+        self.assertIn("ensembleMOSnormal", set(robjects.r["class"](fit)))  # type: ignore
         self.assertTrue({"training", "a", "B", "c", "d"}.issubset(fit.names))
         for parameter_name in ("a", "B", "c", "d"):
             self.assertTrue(
                 all(math.isfinite(float(value)) for value in fit.rx2(parameter_name))
             )
 
+        storage_groups = {
+            **groups,
+            ("06", 2): make_daily_max_group(
+                5,
+                initialization_time="06",
+                day_ahead=2,
+            ),
+        }
         completed_at = datetime(2026, 7, 19, 1, 2, 3, tzinfo=timezone.utc)
         with TemporaryDirectory() as output_dir:
             first_path = save_daily_max_temperature_emos_fits(
                 fits,
-                groups,
+                storage_groups,
                 "Chongqing-ZUCK",
                 "test_ensemble",
                 training_days=14,
@@ -224,7 +271,7 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
             )
             second_path = save_daily_max_temperature_emos_fits(
                 fits,
-                groups,
+                storage_groups,
                 "Chongqing-ZUCK",
                 "test_ensemble",
                 training_days=14,
@@ -251,7 +298,7 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
             self.assertEqual(latest.path, second_path)
             self.assertEqual(historical.path, first_path)
             self.assertTrue(
-                bool(robjects.r["identical"](fit, historical.fits[("00", 1)])[0])
+                bool(robjects.r["identical"](fit, historical.fits[("00", 1)])[0])  # type: ignore
             )
             manifest = historical.metadata
             self.assertEqual(manifest["summary"]["fitted_sample_count"], 20)
@@ -259,6 +306,22 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
             self.assertEqual(
                 manifest["groups"][0]["resolved_training_days"],
                 14,
+            )
+            self.assertEqual(
+                manifest["training_options"]["minimum_training_days"],
+                DEFAULT_MINIMUM_TRAINING_DAYS,
+            )
+            self.assertEqual(
+                manifest["skipped_groups"],
+                [
+                    {
+                        "initialization_hour_utc": "06",
+                        "day_ahead": 2,
+                        "sample_count": 5,
+                        "reason": "insufficient_training_dates",
+                        "required_training_dates": 14,
+                    }
+                ],
             )
             self.assertEqual(manifest["groups"][0]["parameter_set_count"], 7)
             self.assertEqual(
@@ -270,9 +333,7 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
                 {"source": "unit-test"},
             )
 
-            latest_fit_file = (
-                latest.path / latest.metadata["groups"][0]["fit_file"]
-            )
+            latest_fit_file = latest.path / latest.metadata["groups"][0]["fit_file"]
             with latest_fit_file.open("ab") as output_file:
                 output_file.write(b"tampered")
             with self.assertRaisesRegex(ValueError, "checksum mismatch"):
@@ -343,12 +404,11 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
                         "Chongqing-ZUCK",
                         "test_ensemble",
                         training_days=2,
+                        minimum_training_days=2,
                         output_dir=output_dir,
                     )
 
-            model_directory = (
-                Path(output_dir) / "Chongqing-ZUCK" / "test_ensemble"
-            )
+            model_directory = Path(output_dir) / "Chongqing-ZUCK" / "test_ensemble"
             self.assertTrue(model_directory.is_dir())
             self.assertEqual(list(model_directory.iterdir()), [])
 
@@ -414,8 +474,7 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
                 side_effect=train_groups,
             ) as trainer,
             patch(
-                "train_emos_max_temperature."
-                "save_daily_max_temperature_emos_fits",
+                "train_emos_max_temperature." "save_daily_max_temperature_emos_fits",
                 side_effect=save_fits,
             ) as saver,
         ):
@@ -438,15 +497,9 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
         self.assertEqual(
             artifacts,
             {
-                ("City-One", "model-a"): Path(
-                    "output-models/City-One/model-a/version"
-                ),
-                ("City-One", "model-b"): Path(
-                    "output-models/City-One/model-b/version"
-                ),
-                ("City-Two", "model-c"): Path(
-                    "output-models/City-Two/model-c/version"
-                ),
+                ("City-One", "model-a"): Path("output-models/City-One/model-a/version"),
+                ("City-One", "model-b"): Path("output-models/City-One/model-b/version"),
+                ("City-Two", "model-c"): Path("output-models/City-Two/model-c/version"),
             },
         )
         self.assertEqual(
@@ -467,6 +520,13 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
         self.assertEqual(grouper.call_count, 3)
         self.assertEqual(trainer.call_count, 3)
         self.assertEqual(saver.call_count, 3)
+        self.assertTrue(
+            all(
+                training_call.kwargs["minimum_training_days"]
+                == DEFAULT_MINIMUM_TRAINING_DAYS
+                for training_call in trainer.call_args_list
+            )
+        )
         self.assertEqual(
             [
                 training_call.kwargs["input_unit"]
@@ -476,6 +536,10 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
         )
         for save_call in saver.call_args_list:
             self.assertEqual(save_call.kwargs["training_days"], 30)
+            self.assertEqual(
+                save_call.kwargs["minimum_training_days"],
+                DEFAULT_MINIMUM_TRAINING_DAYS,
+            )
             self.assertEqual(save_call.kwargs["output_dir"], "output-models")
             self.assertEqual(save_call.kwargs["extra_metadata"]["run"], "nightly")
             self.assertIs(
@@ -515,15 +579,17 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
                 "train_emos_max_temperature.train_daily_max_temperature_emos"
             ) as trainer,
             patch(
-                "train_emos_max_temperature."
-                "save_daily_max_temperature_emos_fits"
+                "train_emos_max_temperature." "save_daily_max_temperature_emos_fits"
             ) as saver,
         ):
             with self.assertRaisesRegex(
                 ValueError,
-                "no daily-max EMOS training groups for City-One/model-a",
+                "No daily-max EMOS training groups for City-One/model-a",
             ):
-                train_all_daily_max_temperature_emos(cities=[city])
+                train_all_daily_max_temperature_emos(
+                    cities=[city],
+                    skip_insufficient=False,
+                )
         trainer.assert_not_called()
         saver.assert_not_called()
 
@@ -546,18 +612,21 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
                 return_value={},
             ),
             patch(
-                "train_emos_max_temperature."
-                "save_daily_max_temperature_emos_fits"
+                "train_emos_max_temperature." "save_daily_max_temperature_emos_fits"
             ) as saver,
         ):
-            with self.assertRaisesRegex(
-                ValueError,
-                "no daily-max EMOS fits produced for City-One/model-a",
-            ):
-                train_all_daily_max_temperature_emos(
+            with self.assertLogs(
+                "train_emos_max_temperature",
+                level="WARNING",
+            ) as warning_logs:
+                artifacts = train_all_daily_max_temperature_emos(
                     cities=[city],
-                    skip_insufficient=True,
                 )
+        self.assertEqual(artifacts, {})
+        self.assertIn(
+            "No daily-max EMOS fits produced for City-One/model-a",
+            "\n".join(warning_logs.output),
+        )
         saver.assert_not_called()
 
     def test_train_all_daily_max_emos_validates_config_before_loading(self):
@@ -604,10 +673,7 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
         self.assertTrue(all(isinstance(item, dict) for item in temperatures))
         self.assertEqual(
             [item["meta"]["last_run_initialisation_time"] for item in forecasts],
-            sorted(
-                item["meta"]["last_run_initialisation_time"]
-                for item in forecasts
-            ),
+            sorted(item["meta"]["last_run_initialisation_time"] for item in forecasts),
         )
         self.assertEqual(
             [item["time"] for item in temperatures],
