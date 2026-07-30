@@ -10,6 +10,7 @@ CITY = [
         ],
         "ICAO": "ZUCK",
         "temp_unit": "C",
+        "slug_prefix": "highest-temperature-in-chongqing",
     },
     {
         "name": "Chengdu-ZUUU",
@@ -22,6 +23,7 @@ CITY = [
         ],
         "ICAO": "ZUUU",
         "temp_unit": "C",
+        "slug_prefix": "highest-temperature-in-chengdu",
     },
     {
         "name": "Shenzhen-ZGSZ",
@@ -34,6 +36,7 @@ CITY = [
         ],
         "ICAO": "ZGSZ",
         "temp_unit": "C",
+        "slug_prefix": "highest-temperature-in-shenzhen",
     },
     {
         "name": "Wuhan-ZHHH",
@@ -46,6 +49,7 @@ CITY = [
         ],
         "ICAO": "ZHHH",
         "temp_unit": "C",
+        "slug_prefix": "highest-temperature-in-wuhan",
     },
     {
         "name": "Seoul-RKSI",
@@ -58,6 +62,7 @@ CITY = [
         ],
         "ICAO": "RKSI",
         "temp_unit": "C",
+        "slug_prefix": "highest-temperature-in-seoul",
     },
     {
         "name": "Paris-LFPB",
@@ -70,6 +75,7 @@ CITY = [
         ],
         "ICAO": "LFPB",
         "temp_unit": "C",
+        "slug_prefix": "highest-temperature-in-paris",
     },
     {
         "name": "Madrid-LEMD",
@@ -82,6 +88,7 @@ CITY = [
         ],
         "ICAO": "LEMD",
         "temp_unit": "C",
+        "slug_prefix": "highest-temperature-in-madrid",
     },
 ]
 
