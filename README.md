@@ -6,6 +6,8 @@ source venv/bin/activate
 pip install pandas requests numpy rpy2
 ```
 
+## Init R Package
+`https://cran.r-project.org/web/packages/ensembleMOS/index.html`
 
 ## Example data
 ### open-meteo essemble api

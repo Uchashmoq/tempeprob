@@ -10,7 +10,7 @@ def ensemble_forcast(lat, lon, model="ecmwf_aifs025_ensemble") -> dict:
         "longitude": lon,
         "hourly": "temperature_2m",
         "models": [model],
-        "forecast_days": 3,
+        "forecast_days": 7,
         "timeformat": "unixtime",
         "wind_speed_unit": "ms",
     }
