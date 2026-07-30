@@ -4,6 +4,7 @@ venv/
 test-data/
 data/
 /train/highest_temperature_emos/
+/train/model_artifacts/
 refcode/
 log.*
 __pycache__/
