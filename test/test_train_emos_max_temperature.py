@@ -19,6 +19,7 @@ from train_emos_max_temperature import (
     save_daily_max_temperature_emos_fits,
     train_all_daily_max_temperature_emos,
     train_daily_max_temperature_emos,
+    train_daily_max_temperature_emos_for_city_model,
 )
 
 TEST_DATA_DIR = Path(__file__).resolve().parents[1] / "test-data" / "data2"
@@ -553,6 +554,181 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
                 9.0,
             )
             self.assertTrue(batch_metadata["custom_control_supplied"])
+
+    def test_train_daily_max_emos_for_one_city_model(self):
+        cities = [
+            {
+                "name": "City-One",
+                "timezone": "Asia/Shanghai",
+                "temp_unit": "C",
+                "models": [{"name": "model-a"}, {"name": "model-b"}],
+            },
+            {
+                "name": "City-Two",
+                "timezone": "Europe/Paris",
+                "temp_unit": "K",
+                "models": [{"name": "model-c"}],
+            },
+        ]
+        forecasts = [{"forecast": 1}]
+        temperatures = [{"observation": 1}, {"observation": 2}]
+        groups = {("00", 1): {"group": 1}}
+        fits = {("00", 1): "fit"}
+        version_path = Path(
+            "output-models/City-One/model-b/versions/test-version"
+        )
+
+        with (
+            patch(
+                "train_emos_max_temperature._load_temperatures",
+                return_value=temperatures,
+            ) as temperature_loader,
+            patch(
+                "train_emos_max_temperature._load_forecasts",
+                return_value=forecasts,
+            ) as forecast_loader,
+            patch(
+                "train_emos_max_temperature."
+                "group_daily_max_temperature_emos_training_data",
+                return_value=groups,
+            ) as grouper,
+            patch(
+                "train_emos_max_temperature.train_daily_max_temperature_emos",
+                return_value=fits,
+            ) as trainer,
+            patch(
+                "train_emos_max_temperature."
+                "save_daily_max_temperature_emos_fits",
+                return_value=version_path,
+            ) as saver,
+        ):
+            result = train_daily_max_temperature_emos_for_city_model(
+                "City-One",
+                "model-b",
+                cities=cities,
+                data_dir="input-data",
+                output_dir="output-models",
+                training_days=30,
+                minimum_training_days=12,
+                expected_interval_seconds=1800,
+                minimum_observation_coverage=0.75,
+                minimum_notice_hours=9.0,
+                max_day_ahead=7,
+                exchangeable=False,
+                consecutive=True,
+                control="custom-control",
+                warm_start=True,
+                extra_metadata={"trigger": "forecast_update"},
+            )
+
+        self.assertEqual(result, version_path)
+        temperature_loader.assert_called_once_with(
+            "City-One",
+            data_dir=Path("input-data"),
+        )
+        forecast_loader.assert_called_once_with(
+            "City-One",
+            "model-b",
+            data_dir=Path("input-data"),
+        )
+        grouper.assert_called_once_with(
+            forecasts,
+            temperatures,
+            ZoneInfo("Asia/Shanghai"),
+            expected_interval_seconds=1800,
+            minimum_observation_coverage=0.75,
+            minimum_notice_hours=9.0,
+            max_day_ahead=7,
+        )
+        trainer.assert_called_once_with(
+            groups,
+            training_days=30,
+            minimum_training_days=12,
+            input_unit="celsius",
+            exchangeable=False,
+            consecutive=True,
+            control="custom-control",
+            warm_start=True,
+            skip_insufficient=True,
+        )
+        saver.assert_called_once()
+        save_call = saver.call_args
+        self.assertEqual(save_call.args[:4], (fits, groups, "City-One", "model-b"))
+        self.assertEqual(save_call.kwargs["output_dir"], "output-models")
+        self.assertEqual(
+            save_call.kwargs["extra_metadata"]["trigger"],
+            "forecast_update",
+        )
+        batch_metadata = save_call.kwargs["extra_metadata"]["batch_training"]
+        self.assertEqual(batch_metadata["forecast_record_count"], 1)
+        self.assertEqual(batch_metadata["temperature_record_count"], 2)
+        self.assertEqual(batch_metadata["city_timezone"], "Asia/Shanghai")
+
+    def test_train_daily_max_emos_for_one_city_model_skips_empty_groups(self):
+        city = {
+            "name": "City-One",
+            "timezone": "Asia/Shanghai",
+            "models": [{"name": "model-a"}],
+        }
+        with (
+            patch(
+                "train_emos_max_temperature._load_temperatures",
+                return_value=[{"observation": 1}],
+            ),
+            patch(
+                "train_emos_max_temperature._load_forecasts",
+                return_value=[{"forecast": 1}],
+            ),
+            patch(
+                "train_emos_max_temperature."
+                "group_daily_max_temperature_emos_training_data",
+                return_value={},
+            ),
+            patch(
+                "train_emos_max_temperature.train_daily_max_temperature_emos"
+            ) as trainer,
+            patch(
+                "train_emos_max_temperature."
+                "save_daily_max_temperature_emos_fits"
+            ) as saver,
+        ):
+            with self.assertLogs(
+                "train_emos_max_temperature",
+                level="WARNING",
+            ) as warning_logs:
+                result = train_daily_max_temperature_emos_for_city_model(
+                    "City-One",
+                    "model-a",
+                    cities=[city],
+                )
+
+        self.assertIsNone(result)
+        self.assertIn(
+            "No daily-max EMOS training groups for City-One/model-a",
+            "\n".join(warning_logs.output),
+        )
+        trainer.assert_not_called()
+        saver.assert_not_called()
+
+    def test_train_daily_max_emos_for_one_city_model_validates_before_io(self):
+        city = {
+            "name": "City-One",
+            "timezone": "Asia/Shanghai",
+            "models": [{"name": "model-a"}],
+        }
+        with patch(
+            "train_emos_max_temperature._load_temperatures"
+        ) as temperature_loader:
+            with self.assertRaisesRegex(
+                ValueError,
+                "model 'missing' is not configured",
+            ):
+                train_daily_max_temperature_emos_for_city_model(
+                    "City-One",
+                    "missing",
+                    cities=[city],
+                )
+        temperature_loader.assert_not_called()
 
     def test_train_all_daily_max_emos_rejects_empty_pipeline_results(self):
         city = {

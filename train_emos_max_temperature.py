@@ -36,6 +36,7 @@ __all__ = [
     "DailyMaxGroupKey",
     "DEFAULT_MINIMUM_TRAINING_DAYS",
     "train_all_daily_max_temperature_emos",
+    "train_daily_max_temperature_emos_for_city_model",
     # "build_daily_max_temperature_ensemble_data",
     # "group_daily_max_temperature_emos_training_data",
     # "load_daily_max_temperature_emos_fits",
@@ -1477,6 +1478,219 @@ def _prepare_daily_max_batch_cities(
     return tuple(prepared_cities)
 
 
+def _validate_daily_max_pipeline_options(
+    *,
+    minimum_training_days: int,
+    skip_insufficient: bool,
+    extra_metadata: dict[str, Any] | None,
+) -> None:
+    if extra_metadata is not None and not isinstance(extra_metadata, dict):
+        raise ValueError("extra_metadata must be a dictionary or None")
+    if (
+        isinstance(minimum_training_days, bool)
+        or not isinstance(minimum_training_days, int)
+        or minimum_training_days <= 0
+    ):
+        raise ValueError("minimum_training_days must be a positive integer")
+    if not isinstance(skip_insufficient, bool):
+        raise ValueError("skip_insufficient must be a boolean")
+
+
+def _train_prepared_daily_max_city_model(
+    city: _DailyMaxBatchCity,
+    model_name: str,
+    temperatures: list[dict[str, Any]],
+    *,
+    source_directory: Path,
+    output_dir: str | Path,
+    training_days: int | None,
+    minimum_training_days: int,
+    expected_interval_seconds: int,
+    minimum_observation_coverage: float,
+    minimum_notice_hours: float,
+    max_day_ahead: int | None,
+    exchangeable: bool | list[str] | tuple[str, ...],
+    consecutive: bool,
+    control: Any | None,
+    warm_start: bool,
+    skip_insufficient: bool,
+    extra_metadata: dict[str, Any] | None,
+) -> Path | None:
+    """Run the load/group/fit/save pipeline for one prepared city/model."""
+    if model_name not in city.model_names:
+        raise ValueError(
+            f"model {model_name!r} is not configured for city {city.name!r}"
+        )
+
+    forecasts = _load_forecasts(
+        city.name,
+        model_name,
+        data_dir=source_directory,
+    )
+    groups = group_daily_max_temperature_emos_training_data(
+        forecasts,
+        temperatures,
+        city.timezone,
+        expected_interval_seconds=expected_interval_seconds,
+        minimum_observation_coverage=minimum_observation_coverage,
+        minimum_notice_hours=minimum_notice_hours,
+        max_day_ahead=max_day_ahead,
+    )
+    if not groups:
+        message = (
+            "No daily-max EMOS training groups for "
+            f"{city.name}/{model_name}"
+        )
+        if skip_insufficient:
+            logger.warning("%s; skipping model", message)
+            return None
+        raise ValueError(message)
+
+    fits = train_daily_max_temperature_emos(
+        groups,
+        training_days=training_days,
+        minimum_training_days=minimum_training_days,
+        input_unit=city.input_unit,
+        exchangeable=exchangeable,
+        consecutive=consecutive,
+        control=control,
+        warm_start=warm_start,
+        skip_insufficient=skip_insufficient,
+    )
+    if not fits:
+        message = (
+            "No daily-max EMOS fits produced for "
+            f"{city.name}/{model_name}; all groups are insufficient"
+        )
+        if skip_insufficient:
+            logger.warning("%s; skipping model", message)
+            return None
+        raise ValueError(message)
+
+    training_completed_at = datetime.now(timezone.utc)
+    artifact_metadata = dict(extra_metadata or {})
+    artifact_metadata["batch_training"] = {
+        "data_directory": str(source_directory),
+        "city_timezone": city.timezone.key,
+        "forecast_record_count": len(forecasts),
+        "temperature_record_count": len(temperatures),
+        "grouping_options": {
+            "expected_interval_seconds": expected_interval_seconds,
+            "minimum_observation_coverage": minimum_observation_coverage,
+            "minimum_notice_hours": minimum_notice_hours,
+            "max_day_ahead": max_day_ahead,
+        },
+        "custom_control_supplied": control is not None,
+    }
+    return save_daily_max_temperature_emos_fits(
+        fits,
+        groups,
+        city.name,
+        model_name,
+        training_days=training_days,
+        minimum_training_days=minimum_training_days,
+        input_unit=city.input_unit,
+        exchangeable=exchangeable,
+        consecutive=consecutive,
+        warm_start=warm_start,
+        skip_insufficient=skip_insufficient,
+        training_completed_at=training_completed_at,
+        extra_metadata=artifact_metadata,
+        output_dir=output_dir,
+    )
+
+
+def train_daily_max_temperature_emos_for_city_model(
+    city_name: str,
+    model_name: str,
+    *,
+    cities: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    data_dir: str | Path | None = None,
+    output_dir: str | Path = HIGHEST_TEMPERATURE_EMOS_DIR,
+    training_days: int | None = None,
+    minimum_training_days: int = DEFAULT_MINIMUM_TRAINING_DAYS,
+    expected_interval_seconds: int = 3600,
+    minimum_observation_coverage: float = 1.0,
+    minimum_notice_hours: float = 0.0,
+    max_day_ahead: int | None = None,
+    input_unit: str | None = None,
+    exchangeable: bool | list[str] | tuple[str, ...] = True,
+    consecutive: bool = False,
+    control: Any | None = None,
+    warm_start: bool = False,
+    skip_insufficient: bool = True,
+    extra_metadata: dict[str, Any] | None = None,
+) -> Path | None:
+    """Train and version one configured city/model daily-maximum EMOS fit.
+
+    A successful save returns the new version directory.  With
+    ``skip_insufficient=True``, no usable groups or fits logs a warning and
+    returns ``None`` without publishing an empty version.
+    """
+    _validate_daily_max_pipeline_options(
+        minimum_training_days=minimum_training_days,
+        skip_insufficient=skip_insufficient,
+        extra_metadata=extra_metadata,
+    )
+    validated_city_name = _validate_storage_component(
+        city_name,
+        "city name",
+    )
+    validated_model_name = _validate_storage_component(
+        model_name,
+        "model name",
+    )
+    prepared_cities = _prepare_daily_max_batch_cities(cities, input_unit)
+    matching_cities = [
+        city
+        for city in prepared_cities
+        if city.name == validated_city_name
+    ]
+    if not matching_cities:
+        raise ValueError(f"unknown configured city: {validated_city_name!r}")
+    matching_pairs = [
+        city
+        for city in matching_cities
+        if validated_model_name in city.model_names
+    ]
+    if not matching_pairs:
+        raise ValueError(
+            f"model {validated_model_name!r} is not configured for city "
+            f"{validated_city_name!r}"
+        )
+    if len(matching_pairs) != 1:
+        raise ValueError(
+            "duplicate city/model configuration: "
+            f"{validated_city_name}/{validated_model_name}"
+        )
+
+    city = matching_pairs[0]
+    source_directory = DATA_DIR if data_dir is None else Path(data_dir)
+    temperatures = _load_temperatures(
+        city.name,
+        data_dir=source_directory,
+    )
+    return _train_prepared_daily_max_city_model(
+        city,
+        validated_model_name,
+        temperatures,
+        source_directory=source_directory,
+        output_dir=output_dir,
+        training_days=training_days,
+        minimum_training_days=minimum_training_days,
+        expected_interval_seconds=expected_interval_seconds,
+        minimum_observation_coverage=minimum_observation_coverage,
+        minimum_notice_hours=minimum_notice_hours,
+        max_day_ahead=max_day_ahead,
+        exchangeable=exchangeable,
+        consecutive=consecutive,
+        control=control,
+        warm_start=warm_start,
+        skip_insufficient=skip_insufficient,
+        extra_metadata=extra_metadata,
+    )
+
+
 def train_all_daily_max_temperature_emos(
     *,
     cities: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
@@ -1505,16 +1719,11 @@ def train_all_daily_max_temperature_emos(
     default; models with no remaining fit are also skipped.  Set
     ``skip_insufficient=False`` for fail-fast behavior.
     """
-    if extra_metadata is not None and not isinstance(extra_metadata, dict):
-        raise ValueError("extra_metadata must be a dictionary or None")
-    if (
-        isinstance(minimum_training_days, bool)
-        or not isinstance(minimum_training_days, int)
-        or minimum_training_days <= 0
-    ):
-        raise ValueError("minimum_training_days must be a positive integer")
-    if not isinstance(skip_insufficient, bool):
-        raise ValueError("skip_insufficient must be a boolean")
+    _validate_daily_max_pipeline_options(
+        minimum_training_days=minimum_training_days,
+        skip_insufficient=skip_insufficient,
+        extra_metadata=extra_metadata,
+    )
     prepared_cities = _prepare_daily_max_batch_cities(cities, input_unit)
     source_directory = DATA_DIR if data_dir is None else Path(data_dir)
     artifact_paths: dict[tuple[str, str], Path] = {}
@@ -1525,83 +1734,27 @@ def train_all_daily_max_temperature_emos(
             data_dir=source_directory,
         )
         for model_name in city.model_names:
-            forecasts = _load_forecasts(
-                city.name,
+            artifact_path = _train_prepared_daily_max_city_model(
+                city,
                 model_name,
-                data_dir=source_directory,
-            )
-            groups = group_daily_max_temperature_emos_training_data(
-                forecasts,
                 temperatures,
-                city.timezone,
+                source_directory=source_directory,
+                output_dir=output_dir,
+                training_days=training_days,
+                minimum_training_days=minimum_training_days,
                 expected_interval_seconds=expected_interval_seconds,
                 minimum_observation_coverage=minimum_observation_coverage,
                 minimum_notice_hours=minimum_notice_hours,
                 max_day_ahead=max_day_ahead,
-            )
-            if not groups:
-                message = (
-                    "No daily-max EMOS training groups for " f"{city.name}/{model_name}"
-                )
-                if skip_insufficient:
-                    logger.warning("%s; skipping model", message)
-                    continue
-                raise ValueError(message)
-
-            fits = train_daily_max_temperature_emos(
-                groups,
-                training_days=training_days,
-                minimum_training_days=minimum_training_days,
-                input_unit=city.input_unit,
                 exchangeable=exchangeable,
                 consecutive=consecutive,
                 control=control,
                 warm_start=warm_start,
                 skip_insufficient=skip_insufficient,
+                extra_metadata=extra_metadata,
             )
-            if not fits:
-                message = (
-                    "No daily-max EMOS fits produced for "
-                    f"{city.name}/{model_name}; all groups are insufficient"
-                )
-                if skip_insufficient:
-                    logger.warning("%s; skipping model", message)
-                    continue
-                raise ValueError(message)
-
-            training_completed_at = datetime.now(timezone.utc)
-            artifact_metadata = dict(extra_metadata or {})
-            artifact_metadata["batch_training"] = {
-                "data_directory": str(source_directory),
-                "city_timezone": city.timezone.key,
-                "forecast_record_count": len(forecasts),
-                "temperature_record_count": len(temperatures),
-                "grouping_options": {
-                    "expected_interval_seconds": expected_interval_seconds,
-                    "minimum_observation_coverage": minimum_observation_coverage,
-                    "minimum_notice_hours": minimum_notice_hours,
-                    "max_day_ahead": max_day_ahead,
-                },
-                "custom_control_supplied": control is not None,
-            }
-            artifact_paths[(city.name, model_name)] = (
-                save_daily_max_temperature_emos_fits(
-                    fits,
-                    groups,
-                    city.name,
-                    model_name,
-                    training_days=training_days,
-                    minimum_training_days=minimum_training_days,
-                    input_unit=city.input_unit,
-                    exchangeable=exchangeable,
-                    consecutive=consecutive,
-                    warm_start=warm_start,
-                    skip_insufficient=skip_insufficient,
-                    training_completed_at=training_completed_at,
-                    extra_metadata=artifact_metadata,
-                    output_dir=output_dir,
-                )
-            )
+            if artifact_path is not None:
+                artifact_paths[(city.name, model_name)] = artifact_path
 
     return artifact_paths
 

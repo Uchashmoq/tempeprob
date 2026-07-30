@@ -3,8 +3,10 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
+
 import config
 import data_source
+import train_emos_max_temperature
 
 latest_forecast: dict[str, dict] = {}
 
@@ -93,27 +95,83 @@ def update_forecast(city, model):
     return True
 
 
-def update_forecast_periotically():
+def _initialize_latest_forecasts():
     for city in config.CITY:
         city_name = city["name"]
         for model in city["models"]:
             model_name = model["name"]
             key = f"{city_name}/{model_name}"
             lfc = get_latest_forecast(city_name, model_name)
-            if lfc != None:
+            if lfc is not None:
                 latest_forecast[key] = lfc
             else:
                 latest_forecast[key] = {}
 
+
+def _forecast_update_training_metadata(
+    city_name: str,
+    model_name: str,
+) -> dict:
+    metadata = {"trigger": "forecast_update"}
+    forecast = latest_forecast.get(f"{city_name}/{model_name}")
+    if isinstance(forecast, dict):
+        forecast_metadata = forecast.get("meta")
+        if isinstance(forecast_metadata, dict):
+            metadata["forecast_meta"] = dict(forecast_metadata)  # type: ignore
+    return metadata
+
+
+def _update_forecasts_once():
+    """Update every configured forecast and train each changed city/model."""
+    for city in config.CITY:
+        city_name = city["name"]
+        for model in city["models"]:
+            model_name = model["name"]
+            try:
+                updated = update_forecast(city, model_name)
+            except Exception:
+                logging.exception(
+                    "Failed to update forecast for %s/%s",
+                    city_name,
+                    model_name,
+                )
+                continue
+
+            if updated is not True:
+                continue
+
+            try:
+                train_city_model = (
+                    train_emos_max_temperature.train_daily_max_temperature_emos_for_city_model
+                )
+                artifact_path = train_city_model(
+                    city_name,
+                    model_name,
+                    extra_metadata=_forecast_update_training_metadata(
+                        city_name,
+                        model_name,
+                    ),
+                )
+            except Exception:
+                logging.exception(
+                    "Forecast updated but failed to train daily-max EMOS " "for %s/%s",
+                    city_name,
+                    model_name,
+                )
+                continue
+
+            if artifact_path is not None:
+                logging.info(
+                    "Trained daily-max EMOS for %s/%s: %s",
+                    city_name,
+                    model_name,
+                    artifact_path,
+                )
+
+
+def update_forecast_periotically():
+    _initialize_latest_forecasts()
+
     while True:
-        for city in config.CITY:
-            city_name = city["name"]
-            for model in city["models"]:
-                model_name = model["name"]
-                try:
-                    update_forecast(city, model_name)
-                except Exception:
-                    logging.exception(
-                        "Failed to update forecast for %s/%s", city_name, model_name
-                    )
+        _update_forecasts_once()
         time.sleep(config.UPDATE_FORECAST_INTERVAL)
