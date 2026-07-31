@@ -1,6 +1,7 @@
 .env
 .venv/
 venv/
+.r-library/
 test-data/
 data/
 /train/highest_temperature_emos/

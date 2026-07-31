@@ -45,6 +45,20 @@ venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8001 web_server:app
 ## Init R Package
 `https://cran.r-project.org/web/packages/ensembleMOS/index.html`
 
+Install the required R packages into `.r-library` under the project root:
+
+```bash
+./script/install_r_packages.sh
+export R_LIBS_USER="$PWD/.r-library"
+```
+
+The script detects the project root from its own location, so the repository
+does not need to be installed under `/opt`. To select another R library:
+
+```bash
+./script/install_r_packages.sh /srv/tempeprob-r-library
+```
+
 ## Example data
 ### open-meteo essemble api
 `https://ensemble-api.open-meteo.com/v1/ensemble?latitude=29.57&longitude=106.55&hourly=temperature_2m&models=ecmwf_ifs025_ensemble&forecast_days=3&timeformat=unixtime&wind_speed_unit=ms`
