@@ -40,6 +40,17 @@ venv/bin/python web_server.py --collect
 Do not run `collect.py` separately at the same time, or the two processes may
 attempt to collect and append the same updates.
 
+Check every city's temperature JSONL for missing hourly slots:
+
+```bash
+venv/bin/python script/check_temperature_continuity.py
+```
+
+The default output groups missing hours by each configured city's local date.
+Use `--details` to additionally print the underlying UTC ranges, or
+`--names-only` to print only the city directory names. The command exits with
+status 1 when any city has a gap or invalid record.
+
 For a public deployment, expose the Bottle WSGI application through a
 production server instead of the built-in development server:
 
