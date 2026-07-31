@@ -6,6 +6,32 @@ source venv/bin/activate
 pip install pandas requests numpy rpy2 bottle
 ```
 
+## Prediction dashboard
+
+The read-only Bottle dashboard scans
+`prediction/highest_temperature_emos/*/*/predictions.jsonl` on every request,
+so newly appended prediction revisions appear after a page refresh.
+
+```bash
+venv/bin/python web_server.py
+```
+
+Open <http://127.0.0.1:8001>. Optional arguments:
+
+```bash
+venv/bin/python web_server.py \
+  --host 127.0.0.1 \
+  --port 8001 \
+  --prediction-dir prediction/highest_temperature_emos
+```
+
+For a public deployment, expose the Bottle WSGI application through a
+production server instead of the built-in development server:
+
+```bash
+venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8001 web_server:app
+```
+
 ## Init R Package
 `https://cran.r-project.org/web/packages/ensembleMOS/index.html`
 
