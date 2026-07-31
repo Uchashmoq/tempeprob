@@ -131,6 +131,7 @@
     <div class="model-grid">
       % for item in city["records"]:
         % record = item["record"]
+        % comparison = item["market_comparison"]
       <article class="prediction-card">
         <header class="card-heading">
           <div>
@@ -146,21 +147,45 @@
           <b>{{record.peak_interval.percent_text}}</b>
         </div>
 
-        <ol class="probability-list" aria-label="温度区间概率">
-          % for interval in record.intervals:
-          <li class="probability-row{{' is-peak' if interval == record.peak_interval else ''}}">
-            <div class="probability-label">
-              <span>{{interval.display_label}}</span>
-              <strong title="{{interval.precise_percent_text}}">
+        <div class="probability-comparison-header" aria-hidden="true">
+          <span>温度</span>
+          <span>模型</span>
+          <span>市场 Yes</span>
+          <span title="模型概率减去市场 Yes 价格（百分点）">差值</span>
+        </div>
+        <ol class="probability-list comparison-list" aria-label="模型概率与 Polymarket Yes 价格对比">
+          % for row in comparison.rows:
+            % interval = row.interval
+          <li class="probability-row comparison-row{{' is-peak' if interval == record.peak_interval else ''}}">
+            <div class="probability-values">
+              <span class="comparison-temperature">{{interval.display_label}}</span>
+              <strong class="comparison-number model-number" title="模型概率 {{interval.precise_percent_text}}">
                 {{interval.percent_text}}
               </strong>
+              <strong class="comparison-number market-number" title="Polymarket Yes {{row.market_precise_percent_text}}">
+                {{row.market_percent_text}}
+              </strong>
+              <strong class="comparison-number difference-number {{row.difference_class}}" title="模型概率减去市场 Yes 价格">
+                {{row.difference_text}}
+              </strong>
             </div>
-            <div class="probability-track" aria-hidden="true">
-              <span style="width: {{interval.bar_width}}%"></span>
+            <div class="probability-bars" aria-hidden="true">
+              <div class="probability-track is-model">
+                <span style="width: {{interval.bar_width}}%"></span>
+              </div>
+              <div class="probability-track is-market">
+                <span style="width: {{row.market_bar_width}}%"></span>
+              </div>
             </div>
           </li>
           % end
         </ol>
+
+        <div class="comparison-legend" aria-label="图例">
+          <span><i class="legend-swatch is-model"></i>模型概率</span>
+          <span><i class="legend-swatch is-market"></i>市场 Yes</span>
+          <span>差值 = 模型 − 市场</span>
+        </div>
 
         <dl class="card-metadata">
           <div>

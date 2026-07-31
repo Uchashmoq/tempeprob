@@ -34,25 +34,48 @@
       <header class="panel-heading">
         <div>
           <p class="section-kicker">PROBABILITY DISTRIBUTION</p>
-          <h2>区间概率分布</h2>
+          <h2>模型概率 vs 市场价格</h2>
         </div>
-     
       </header>
-      <ol class="probability-list probability-list-large">
-        % for interval in record.intervals:
-        <li class="probability-row{{' is-peak' if interval == record.peak_interval else ''}}">
-          <div class="probability-label">
-            <span>{{interval.display_label}}</span>
-            <strong title="{{interval.precise_percent_text}}">
+
+      <div class="probability-comparison-header probability-comparison-header-large" aria-hidden="true">
+        <span>温度</span>
+        <span>模型概率</span>
+        <span>市场 Yes</span>
+        <span title="模型概率减去市场 Yes 价格（百分点）">差值</span>
+      </div>
+      <ol class="probability-list comparison-list probability-list-large" aria-label="模型概率与 Polymarket Yes 价格对比">
+        % for row in market_comparison.rows:
+          % interval = row.interval
+        <li class="probability-row comparison-row{{' is-peak' if interval == record.peak_interval else ''}}">
+          <div class="probability-values probability-values-large">
+            <span class="comparison-temperature">{{interval.display_label}}</span>
+            <strong class="comparison-number model-number" title="模型概率 {{interval.precise_percent_text}}">
               {{interval.percent_text}}
             </strong>
+            <strong class="comparison-number market-number" title="Polymarket Yes {{row.market_precise_percent_text}}">
+              {{row.market_percent_text}}
+            </strong>
+            <strong class="comparison-number difference-number {{row.difference_class}}" title="模型概率减去市场 Yes 价格">
+              {{row.difference_text}}
+            </strong>
           </div>
-          <div class="probability-track" aria-hidden="true">
-            <span style="width: {{interval.bar_width}}%"></span>
+          <div class="probability-bars" aria-hidden="true">
+            <div class="probability-track is-model">
+              <span style="width: {{interval.bar_width}}%"></span>
+            </div>
+            <div class="probability-track is-market">
+              <span style="width: {{row.market_bar_width}}%"></span>
+            </div>
           </div>
         </li>
         % end
       </ol>
+      <div class="comparison-legend" aria-label="图例">
+        <span><i class="legend-swatch is-model"></i>模型概率</span>
+        <span><i class="legend-swatch is-market"></i>市场 Yes</span>
+        <span>差值 = 模型 − 市场（百分点）</span>
+      </div>
       % if record.market_url:
       <a
         class="external-link"

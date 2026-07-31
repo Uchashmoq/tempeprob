@@ -11,15 +11,18 @@ from wsgiref.util import setup_testing_defaults
 from web_server import (
     IntervalView,
     PREDICTION_RECORD_TYPE,
+    PolymarketPriceCache,
     create_app,
     load_prediction_catalog,
     main,
 )
+from polymarket import PolymarketAPIError
 
 
 CITY = "City-ZZZZ"
 MODEL = "model-a"
 TARGET_DATE = "2026-08-01"
+EVENT_SLUG = "highest-temperature-in-city-on-august-1-2026"
 
 
 def make_record(
@@ -43,9 +46,7 @@ def make_record(
         "target_date_local": target_date,
         "market": {
             "slug_prefix": "highest-temperature-in-city",
-            "event_slug": (
-                "highest-temperature-in-city-on-august-1-2026"
-            ),
+            "event_slug": EVENT_SLUG,
             "boundaries": [30.0],
             "unit": "celsius",
             "fetched_at_utc": "2026-07-31T03:59:00.000000Z",
@@ -101,6 +102,52 @@ def make_record(
             },
         ],
     }
+
+
+def make_market_event(
+    *,
+    yes_prices: tuple[float, float] = (0.4, 0.6),
+    titles: tuple[str, str] = (
+        "29°C or below",
+        "30°C or higher",
+    ),
+) -> dict:
+    return {
+        "id": "event-1",
+        "slug": EVENT_SLUG,
+        "markets": [
+            {
+                "id": f"market-{index}",
+                "slug": f"{EVENT_SLUG}-{index}",
+                "groupItemTitle": title,
+                "outcomes": json.dumps(["Yes", "No"]),
+                "outcomePrices": json.dumps(
+                    [str(yes_price), str(1 - yes_price)]
+                ),
+            }
+            for index, (title, yes_price) in enumerate(
+                zip(titles, yes_prices, strict=True)
+            )
+        ],
+    }
+
+
+def make_market_price_cache(
+    *,
+    event: dict | None = None,
+    side_effect=None,
+) -> tuple[PolymarketPriceCache, MagicMock]:
+    fetcher = MagicMock(
+        return_value=make_market_event() if event is None else event,
+        side_effect=side_effect,
+    )
+    return (
+        PolymarketPriceCache(
+            event_fetcher=fetcher,
+            cache_seconds=300,
+        ),
+        fetcher,
+    )
 
 
 def write_records(
@@ -219,7 +266,11 @@ class PredictionCatalogTest(unittest.TestCase):
                 ],
             )
             catalog = load_prediction_catalog(root)
-            status, _, dashboard = wsgi_get(create_app(root), "/")
+            market_price_cache, _ = make_market_price_cache()
+            status, _, dashboard = wsgi_get(
+                create_app(root, market_price_cache=market_price_cache),
+                "/",
+            )
 
         self.assertEqual(len(catalog.records), 1)
         self.assertEqual(len(catalog.issues), 2)
@@ -257,7 +308,11 @@ class WebServerRouteTest(unittest.TestCase):
                 root,
                 [record],
             )
-            app = create_app(root)
+            market_price_cache, fetch_market = make_market_price_cache()
+            app = create_app(
+                root,
+                market_price_cache=market_price_cache,
+            )
 
             status, headers, dashboard = wsgi_get(app, "/")
             city_status, _, city_page = wsgi_get(
@@ -284,6 +339,9 @@ class WebServerRouteTest(unittest.TestCase):
         self.assertNotIn(dangerous_value, dashboard)
         self.assertIn("29 or below", dashboard)
         self.assertIn("30 or higher", dashboard)
+        self.assertIn("Polymarket Yes", dashboard)
+        self.assertIn("40.0%", dashboard)
+        self.assertIn("+40.0 pp", dashboard)
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertIn(
             "default-src 'self'",
@@ -293,6 +351,9 @@ class WebServerRouteTest(unittest.TestCase):
         self.assertTrue(city_status.startswith("200"))
         self.assertIn("City · ZZZZ预测", city_page)
         self.assertTrue(detail_status.startswith("200"))
+        self.assertIn("模型概率 vs 市场价格", detail)
+        self.assertNotIn("Polymarket 快照", detail)
+        self.assertNotIn("market-snapshot-note", detail)
         self.assertIn("预报与修正来源", detail)
         self.assertIn("&lt;script&gt;", detail)
         self.assertNotIn("train/highest_temperature_emos", detail)
@@ -305,6 +366,94 @@ class WebServerRouteTest(unittest.TestCase):
         self.assertTrue(css_status.startswith("200"))
         self.assertTrue(css_headers["Content-Type"].startswith("text/css"))
         self.assertIn(".prediction-card", css_body)
+        fetch_market.assert_called_once_with(EVENT_SLUG, timeout=5.0)
+
+    def test_dashboard_deduplicates_market_fetch_and_compares_two_models(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            write_records(root, [make_record()])
+            second = make_record(
+                prediction_id="b" * 64,
+                model_name="model-b",
+                probabilities=(0.55, 0.45),
+            )
+            write_records(root, [second], model_name="model-b")
+            market_price_cache, fetch_market = make_market_price_cache()
+            before = {
+                path: path.read_bytes()
+                for path in root.glob("*/*/predictions.jsonl")
+            }
+
+            status, _, dashboard = wsgi_get(
+                create_app(root, market_price_cache=market_price_cache),
+                "/",
+            )
+            after = {
+                path: path.read_bytes()
+                for path in root.glob("*/*/predictions.jsonl")
+            }
+
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("模型概率", dashboard)
+        self.assertIn("Polymarket Yes", dashboard)
+        self.assertIn("-15.0 pp", dashboard)
+        self.assertIn("+15.0 pp", dashboard)
+        self.assertEqual(before, after)
+        fetch_market.assert_called_once_with(EVENT_SLUG, timeout=5.0)
+
+    def test_market_api_failure_keeps_saved_prediction_visible(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            write_records(root, [make_record()])
+            market_price_cache, fetch_market = make_market_price_cache(
+                side_effect=PolymarketAPIError(
+                    "service unavailable",
+                    status_code=503,
+                )
+            )
+            app = create_app(
+                root,
+                market_price_cache=market_price_cache,
+            )
+
+            status, _, dashboard = wsgi_get(app, "/")
+            detail_status, _, detail = wsgi_get(
+                app,
+                (
+                    f"/prediction/{quote(CITY, safe='')}/"
+                    f"{quote(MODEL, safe='')}/{TARGET_DATE}/1"
+                ),
+            )
+
+        self.assertTrue(status.startswith("200"))
+        self.assertTrue(detail_status.startswith("200"))
+        self.assertIn("25.0%", dashboard)
+        self.assertNotIn("market-snapshot-note", dashboard)
+        self.assertNotIn("market-snapshot-note", detail)
+        self.assertIn("—", dashboard)
+        self.assertIn("—", detail)
+        fetch_market.assert_called_once_with(EVENT_SLUG, timeout=5.0)
+
+    def test_market_bucket_mismatch_is_not_compared_by_position(self):
+        mismatched_event = make_market_event(
+            titles=("28°C or below", "29°C or higher"),
+        )
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            write_records(root, [make_record()])
+            market_price_cache, _ = make_market_price_cache(
+                event=mismatched_event,
+            )
+
+            status, _, dashboard = wsgi_get(
+                create_app(root, market_price_cache=market_price_cache),
+                "/",
+            )
+
+        self.assertTrue(status.startswith("200"))
+        self.assertNotIn("market-snapshot-note", dashboard)
+        self.assertIn("—", dashboard)
+        self.assertNotIn("-15.0 pp", dashboard)
 
     def test_empty_state_and_missing_detail(self):
         with TemporaryDirectory() as temporary_directory:

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timezone
 import json
 import logging
 import math
-import re
-from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+import re
+from threading import Lock
+from time import monotonic
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -24,10 +27,21 @@ from bottle import (
     template,
 )
 
+from polymarket import (
+    PolymarketAPIError,
+    PolymarketDataError,
+    TemperatureBucketYesPrice,
+    fetch_polymarket_event_by_slug,
+    temperature_yes_prices_from_event,
+)
+
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_PREDICTION_DIR = PROJECT_DIR / "prediction" / "highest_temperature_emos"
 TEMPLATE_DIR = PROJECT_DIR / "web" / "templates"
 STATIC_DIR = PROJECT_DIR / "web" / "static"
+DEFAULT_MARKET_PRICE_TIMEOUT_SECONDS = 5.0
+DEFAULT_MARKET_PRICE_CACHE_SECONDS = 300.0
+DEFAULT_MARKET_PRICE_WORKERS = 6
 
 PREDICTION_RECORD_TYPE = "daily_max_temperature_emos_intervals"
 SUPPORTED_SCHEMA_VERSION = 1
@@ -55,6 +69,24 @@ class DataIssue:
         if self.line_number is None:
             return self.source
         return f"{self.source}:{self.line_number}"
+
+
+@dataclass(frozen=True)
+class MarketPriceSnapshot:
+    """One server-side Polymarket quote snapshot for a temperature event."""
+
+    event_slug: str
+    fetched_at_utc: datetime
+    prices: tuple[TemperatureBucketYesPrice, ...] = ()
+    unavailable_reason: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.unavailable_reason is None and bool(self.prices)
+
+    @property
+    def fetched_at_text(self) -> str:
+        return self.fetched_at_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 @dataclass(frozen=True)
@@ -100,6 +132,79 @@ class IntervalView:
         if self.probability <= 0:
             return "0"
         return f"{max(self.probability * 100, 0.25):.6f}"
+
+
+def _probability_text(value: float) -> str:
+    if value == 0:
+        return "0%"
+    if value < 0.0001:
+        return "<0.01%"
+    if value < 0.01:
+        return f"{value:.2%}"
+    return f"{value:.1%}"
+
+
+@dataclass(frozen=True)
+class IntervalComparisonView:
+    """One EMOS interval aligned with its Polymarket Yes price."""
+
+    interval: IntervalView
+    market_yes_price: float | None
+
+    @property
+    def market_percent_text(self) -> str:
+        if self.market_yes_price is None:
+            return "—"
+        return _probability_text(self.market_yes_price)
+
+    @property
+    def market_precise_percent_text(self) -> str:
+        if self.market_yes_price is None:
+            return "市场价格暂不可用"
+        return f"{self.market_yes_price:.8%}"
+
+    @property
+    def difference_percentage_points(self) -> float | None:
+        if self.market_yes_price is None:
+            return None
+        return (self.interval.probability - self.market_yes_price) * 100
+
+    @property
+    def difference_text(self) -> str:
+        difference = self.difference_percentage_points
+        if difference is None:
+            return "—"
+        if math.isclose(difference, 0.0, abs_tol=0.05):
+            return "0.0 pp"
+        return f"{difference:+.1f} pp"
+
+    @property
+    def difference_class(self) -> str:
+        difference = self.difference_percentage_points
+        if difference is None or math.isclose(difference, 0.0, abs_tol=0.05):
+            return "is-neutral"
+        return "is-positive" if difference > 0 else "is-negative"
+
+    @property
+    def market_bar_width(self) -> str:
+        if self.market_yes_price is None or self.market_yes_price <= 0:
+            return "0"
+        return f"{max(self.market_yes_price * 100, 0.25):.6f}"
+
+
+@dataclass(frozen=True)
+class MarketComparisonView:
+    """Comparison state for one saved model prediction and market event."""
+
+    rows: tuple[IntervalComparisonView, ...]
+    fetched_at_text: str | None
+    unavailable_reason: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.unavailable_reason is None and all(
+            row.market_yes_price is not None for row in self.rows
+        )
 
 
 @dataclass(frozen=True)
@@ -172,9 +277,16 @@ class PredictionRecord:
         return value if isinstance(value, Mapping) else {}
 
     @property
-    def market_url(self) -> str | None:
+    def market_event_slug(self) -> str | None:
         slug = self.market.get("event_slug")
         if not isinstance(slug, str) or not _SAFE_EVENT_SLUG.fullmatch(slug):
+            return None
+        return slug
+
+    @property
+    def market_url(self) -> str | None:
+        slug = self.market_event_slug
+        if slug is None:
             return None
         return f"https://polymarket.com/event/{quote(slug, safe='')}"
 
@@ -347,6 +459,124 @@ class PredictionCatalog:
             ):
                 return record
         return None
+
+
+class PolymarketPriceCache:
+    """Fetch and briefly cache server-side market snapshots by event slug."""
+
+    def __init__(
+        self,
+        *,
+        timeout: float = DEFAULT_MARKET_PRICE_TIMEOUT_SECONDS,
+        cache_seconds: float = DEFAULT_MARKET_PRICE_CACHE_SECONDS,
+        max_workers: int = DEFAULT_MARKET_PRICE_WORKERS,
+        event_fetcher: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
+        if isinstance(timeout, bool):
+            raise ValueError("timeout must be a positive finite number")
+        try:
+            parsed_timeout = float(timeout)
+        except (TypeError, ValueError) as error:
+            raise ValueError("timeout must be a positive finite number") from error
+        if not math.isfinite(parsed_timeout) or parsed_timeout <= 0:
+            raise ValueError("timeout must be a positive finite number")
+        if isinstance(cache_seconds, bool):
+            raise ValueError("cache_seconds must be a positive finite number")
+        try:
+            parsed_cache_seconds = float(cache_seconds)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "cache_seconds must be a positive finite number"
+            ) from error
+        if not math.isfinite(parsed_cache_seconds) or parsed_cache_seconds <= 0:
+            raise ValueError("cache_seconds must be a positive finite number")
+        if (
+            isinstance(max_workers, bool)
+            or not isinstance(max_workers, int)
+            or max_workers <= 0
+        ):
+            raise ValueError("max_workers must be a positive integer")
+        self.timeout = parsed_timeout
+        self.cache_seconds = parsed_cache_seconds
+        self.max_workers = max_workers
+        self._event_fetcher = (
+            fetch_polymarket_event_by_slug if event_fetcher is None else event_fetcher
+        )
+        self._cache: dict[str, tuple[float, MarketPriceSnapshot]] = {}
+        self._lock = Lock()
+
+    def _fetch_snapshot(self, event_slug: str) -> MarketPriceSnapshot:
+        try:
+            event = self._event_fetcher(event_slug, timeout=self.timeout)
+            prices = temperature_yes_prices_from_event(event)
+        except PolymarketAPIError as error:
+            logging.warning(
+                "Could not fetch Polymarket prices for %s: %s",
+                event_slug,
+                error,
+            )
+            return MarketPriceSnapshot(
+                event_slug=event_slug,
+                fetched_at_utc=datetime.now(timezone.utc),
+                unavailable_reason="市场价格暂不可用",
+            )
+        except PolymarketDataError as error:
+            logging.warning(
+                "Invalid Polymarket prices for %s: %s",
+                event_slug,
+                error,
+            )
+            return MarketPriceSnapshot(
+                event_slug=event_slug,
+                fetched_at_utc=datetime.now(timezone.utc),
+                unavailable_reason="市场价格数据无法解析",
+            )
+        return MarketPriceSnapshot(
+            event_slug=event_slug,
+            fetched_at_utc=datetime.now(timezone.utc),
+            prices=prices,
+        )
+
+    def get_many(
+        self,
+        event_slugs: Sequence[str],
+    ) -> dict[str, MarketPriceSnapshot]:
+        """Return one snapshot per unique slug, fetching cache misses in parallel."""
+        requested = tuple(sorted(set(event_slugs)))
+        if not requested:
+            return {}
+
+        now = monotonic()
+        snapshots: dict[str, MarketPriceSnapshot] = {}
+        missing: list[str] = []
+        with self._lock:
+            for event_slug in requested:
+                cached = self._cache.get(event_slug)
+                if cached is not None and cached[0] > now:
+                    snapshots[event_slug] = cached[1]
+                else:
+                    missing.append(event_slug)
+
+        if missing:
+            worker_count = min(self.max_workers, len(missing))
+            if worker_count == 1:
+                fetched = {missing[0]: self._fetch_snapshot(missing[0])}
+            else:
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    fetched = dict(
+                        zip(
+                            missing,
+                            executor.map(self._fetch_snapshot, missing),
+                            strict=True,
+                        )
+                    )
+            expires_at = monotonic() + self.cache_seconds
+            with self._lock:
+                for event_slug, snapshot in fetched.items():
+                    self._cache[event_slug] = (expires_at, snapshot)
+            snapshots.update(fetched)
+
+        return snapshots
 
 
 def _require_string(
@@ -644,9 +874,97 @@ def _validated_filter(
     return value if value in allowed_values else None
 
 
+def _market_comparison(
+    record: PredictionRecord,
+    snapshot: MarketPriceSnapshot | None,
+) -> MarketComparisonView:
+    unavailable_rows = tuple(
+        IntervalComparisonView(interval=interval, market_yes_price=None)
+        for interval in record.intervals
+    )
+    if record.market_event_slug is None:
+        return MarketComparisonView(
+            rows=unavailable_rows,
+            fetched_at_text=None,
+            unavailable_reason="预测记录缺少有效的市场标识",
+        )
+    if snapshot is None:
+        return MarketComparisonView(
+            rows=unavailable_rows,
+            fetched_at_text=None,
+            unavailable_reason="市场价格暂不可用",
+        )
+    if not snapshot.available:
+        return MarketComparisonView(
+            rows=unavailable_rows,
+            fetched_at_text=snapshot.fetched_at_text,
+            unavailable_reason=(snapshot.unavailable_reason or "市场价格暂不可用"),
+        )
+
+    expected_interval_keys = (
+        ((None, record.market_boundaries[0]),)
+        + tuple(zip(record.market_boundaries, record.market_boundaries[1:]))
+        + ((record.market_boundaries[-1], None),)
+    )
+    record_interval_keys = tuple(
+        (interval.lower_bound, interval.upper_bound)
+        for interval in record.intervals
+        if interval.unit == "celsius"
+    )
+    market_interval_keys = tuple(
+        (price.lower_bound_celsius, price.upper_bound_celsius)
+        for price in snapshot.prices
+    )
+    if (
+        len(record_interval_keys) != len(record.intervals)
+        or record_interval_keys != expected_interval_keys
+        or market_interval_keys != expected_interval_keys
+    ):
+        return MarketComparisonView(
+            rows=unavailable_rows,
+            fetched_at_text=snapshot.fetched_at_text,
+            unavailable_reason="市场价格档位与预测档位不一致",
+        )
+
+    price_by_interval = {
+        interval_key: price.yes_price
+        for interval_key, price in zip(
+            market_interval_keys,
+            snapshot.prices,
+            strict=True,
+        )
+    }
+    return MarketComparisonView(
+        rows=tuple(
+            IntervalComparisonView(
+                interval=interval,
+                market_yes_price=price_by_interval[
+                    (interval.lower_bound, interval.upper_bound)
+                ],
+            )
+            for interval in record.intervals
+        ),
+        fetched_at_text=snapshot.fetched_at_text,
+    )
+
+
+def _market_snapshots_for_records(
+    records: Sequence[PredictionRecord],
+    market_price_cache: PolymarketPriceCache,
+) -> dict[str, MarketPriceSnapshot]:
+    return market_price_cache.get_many(
+        tuple(
+            event_slug
+            for record in records
+            if (event_slug := record.market_event_slug) is not None
+        )
+    )
+
+
 def _dashboard_groups(
     records: Sequence[PredictionRecord],
     catalog: PredictionCatalog,
+    market_snapshots: Mapping[str, MarketPriceSnapshot],
 ) -> list[dict[str, Any]]:
     history_counts: dict[tuple[str, str, str, str], int] = {}
     for historical_record in catalog.records:
@@ -679,6 +997,10 @@ def _dashboard_groups(
                         {
                             "record": record,
                             "history_count": history_counts[record.series_key],
+                            "market_comparison": _market_comparison(
+                                record,
+                                market_snapshots.get(record.market_event_slug or ""),
+                            ),
                         }
                         for record in city_records
                     ],
@@ -722,6 +1044,7 @@ def _base_context(
 def _render_dashboard(
     catalog: PredictionCatalog,
     *,
+    market_price_cache: PolymarketPriceCache,
     active_city: str | None = None,
 ) -> str:
     selected_city = active_city or _validated_filter(
@@ -753,11 +1076,15 @@ def _render_dashboard(
         if selected_city is not None
         else "最高气温概率总览"
     )
+    market_snapshots = _market_snapshots_for_records(
+        records,
+        market_price_cache,
+    )
     return template(
         "dashboard",
         template_lookup=[str(TEMPLATE_DIR)],
         catalog=catalog,
-        groups=_dashboard_groups(records, catalog),
+        groups=_dashboard_groups(records, catalog, market_snapshots),
         latest_count=len(catalog.latest_records),
         visible_count=len(records),
         selected_city=selected_city,
@@ -776,9 +1103,14 @@ def _render_dashboard(
 
 def create_app(
     prediction_dir: str | Path = DEFAULT_PREDICTION_DIR,
+    *,
+    market_price_cache: PolymarketPriceCache | None = None,
 ) -> Bottle:
     """Create a read-only Bottle application for one prediction directory."""
     prediction_root = Path(prediction_dir)
+    price_cache = (
+        PolymarketPriceCache() if market_price_cache is None else market_price_cache
+    )
     bottle_app = Bottle()
 
     @bottle_app.hook("after_request")
@@ -800,14 +1132,21 @@ def create_app(
 
     @bottle_app.get("/")  # type: ignore
     def dashboard() -> str:
-        return _render_dashboard(load_prediction_catalog(prediction_root))
+        return _render_dashboard(
+            load_prediction_catalog(prediction_root),
+            market_price_cache=price_cache,
+        )
 
     @bottle_app.get("/city/<city_name>")  # type: ignore
     def city_dashboard(city_name: str) -> str:
         catalog = load_prediction_catalog(prediction_root)
         if city_name not in catalog.cities:
             abort(404, "没有找到该城市的预测数据")
-        return _render_dashboard(catalog, active_city=city_name)
+        return _render_dashboard(
+            catalog,
+            market_price_cache=price_cache,
+            active_city=city_name,
+        )
 
     @bottle_app.get(
         "/prediction/<city_name>/<model_name>/<target_date>/<revision:int>"  # type: ignore
@@ -828,12 +1167,21 @@ def create_app(
         if record is None:
             abort(404, "没有找到该预测版本")
         history = tuple(reversed(catalog.history_for(record)))  # type: ignore
+        market_snapshots = _market_snapshots_for_records(
+            (record,),  # type: ignore
+            price_cache,
+        )
+        market_comparison = _market_comparison(
+            record,  # type: ignore
+            market_snapshots.get(record.market_event_slug or ""),  # type: ignore
+        )
         return template(
             "detail",
             template_lookup=[str(TEMPLATE_DIR)],
             catalog=catalog,
             record=record,
             history=history,
+            market_comparison=market_comparison,
             **_base_context(
                 catalog,
                 page_title=f"{record.city_label} · {record.target_date_label}",  # type: ignore

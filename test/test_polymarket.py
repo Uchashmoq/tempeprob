@@ -1,5 +1,6 @@
-"""Tests for Polymarket daily maximum-temperature boundaries."""
+"""Tests for Polymarket daily maximum-temperature markets."""
 
+import json
 import unittest
 from datetime import date, datetime, timezone
 from unittest.mock import Mock, patch
@@ -12,8 +13,11 @@ from polymarket import (
     PolymarketDataError,
     build_daily_max_temperature_event_slug,
     get_city_daily_max_temperature_boundaries,
+    get_city_daily_max_temperature_yes_prices,
     get_daily_max_temperature_boundaries,
+    get_daily_max_temperature_yes_prices,
     temperature_boundaries_from_event,
+    temperature_yes_prices_from_event,
 )
 
 
@@ -50,6 +54,39 @@ def make_temperature_event(
             for index, title in enumerate(titles)
         ],
     }
+
+
+def add_yes_prices(
+    event: dict,
+    *,
+    json_encoded: bool = True,
+) -> dict[str, float]:
+    """Add deterministic Yes/No prices while varying outcome order."""
+    expected: dict[str, float] = {}
+    for index, market in enumerate(event["markets"]):
+        yes_price = (index + 1) / 20
+        title = market["groupItemTitle"]
+        expected[title] = yes_price
+        if index % 2:
+            outcomes = ["Yes", "No"]
+            prices = [yes_price, 1 - yes_price]
+        else:
+            outcomes = ["No", "Yes"]
+            prices = [1 - yes_price, yes_price]
+        market.update(
+            {
+                "slug": f"temperature-market-{index}",
+                "outcomes": (
+                    json.dumps(outcomes) if json_encoded else outcomes
+                ),
+                "outcomePrices": (
+                    json.dumps([str(price) for price in prices])
+                    if json_encoded
+                    else prices
+                ),
+            }
+        )
+    return expected
 
 
 class PolymarketTemperatureBoundariesTest(unittest.TestCase):
@@ -149,6 +186,142 @@ class PolymarketTemperatureBoundariesTest(unittest.TestCase):
             "2026-07-30",
             timeout=4.0,
         )
+
+    def test_extracts_ordered_yes_prices_from_json_strings(self):
+        event = make_temperature_event()
+        expected = add_yes_prices(event)
+
+        prices = temperature_yes_prices_from_event(event)
+
+        self.assertEqual(
+            [price.title for price in prices],
+            [
+                "33°C or below",
+                "34°C",
+                "35°C",
+                "36°C",
+                "37°C",
+                "38°C",
+                "39°C",
+                "40°C",
+                "41°C",
+                "42°C",
+                "43°C or higher",
+            ],
+        )
+        self.assertEqual(
+            [price.yes_price for price in prices],
+            [expected[price.title] for price in prices],
+        )
+        self.assertEqual(
+            (
+                prices[0].lower_bound_celsius,
+                prices[0].upper_bound_celsius,
+            ),
+            (None, 34.0),
+        )
+        self.assertEqual(
+            (
+                prices[1].lower_bound_celsius,
+                prices[1].upper_bound_celsius,
+            ),
+            (34.0, 35.0),
+        )
+        self.assertEqual(
+            (
+                prices[-1].lower_bound_celsius,
+                prices[-1].upper_bound_celsius,
+            ),
+            (43.0, None),
+        )
+        self.assertEqual(prices[0].market_id, "3")
+        self.assertEqual(prices[0].market_slug, "temperature-market-3")
+
+    def test_accepts_outcomes_and_prices_as_lists(self):
+        event = make_temperature_event(
+            titles=("9°C or below", "10°C or higher"),
+        )
+        expected = add_yes_prices(event, json_encoded=False)
+
+        prices = temperature_yes_prices_from_event(event)
+
+        self.assertEqual(len(prices), 2)
+        self.assertEqual(
+            [price.yes_price for price in prices],
+            [expected[price.title] for price in prices],
+        )
+
+    def test_fetches_yes_prices_and_configured_city_wrapper(self):
+        event = make_temperature_event()
+        add_yes_prices(event)
+        expected = temperature_yes_prices_from_event(event)
+        with patch(
+            "polymarket.fetch_polymarket_event_by_slug",
+            return_value=event,
+        ) as fetch_event:
+            prices = get_daily_max_temperature_yes_prices(
+                SLUG_PREFIX,
+                "2026-07-30",
+                timeout=2.5,
+            )
+
+        self.assertEqual(prices, expected)
+        fetch_event.assert_called_once_with(EVENT_SLUG, timeout=2.5)
+
+        with patch(
+            "polymarket.get_daily_max_temperature_yes_prices",
+            return_value=expected,
+        ) as get_prices:
+            city_prices = get_city_daily_max_temperature_yes_prices(
+                "Chongqing-ZUCK",
+                "2026-07-30",
+                timeout=4,
+            )
+
+        self.assertEqual(city_prices, expected)
+        get_prices.assert_called_once_with(
+            SLUG_PREFIX,
+            "2026-07-30",
+            timeout=4.0,
+        )
+
+    def test_rejects_invalid_outcomes_and_prices(self):
+        invalid_fields = (
+            ("outcomes", "not-json"),
+            ("outcomes", ["No", "Maybe"]),
+            ("outcomes", ["Yes", "YES"]),
+            ("outcomes", ["Yes", 1]),
+            ("outcomePrices", [0.5]),
+            ("outcomePrices", [-0.1, 1.1]),
+            ("outcomePrices", [float("nan"), 0.5]),
+            ("outcomePrices", [True, 0.5]),
+            ("outcomePrices", ["not-a-price", 0.5]),
+        )
+        for field_name, invalid_value in invalid_fields:
+            with self.subTest(field_name=field_name, value=invalid_value):
+                event = make_temperature_event(
+                    titles=("9°C or below", "10°C or higher"),
+                )
+                add_yes_prices(event, json_encoded=False)
+                event["markets"][0][field_name] = invalid_value
+                with self.assertRaises(PolymarketDataError):
+                    temperature_yes_prices_from_event(event)
+
+    def test_yes_prices_require_valid_temperature_bucket_geometry(self):
+        event = make_temperature_event(
+            titles=(
+                "33°C or below",
+                "35°C",
+                "36°C or higher",
+            ),
+        )
+        add_yes_prices(event)
+
+        with self.assertRaisesRegex(
+            PolymarketDataError,
+            "must be consecutive",
+        ):
+            temperature_yes_prices_from_event(event)
 
     def test_rejects_missing_duplicate_or_nonconsecutive_buckets(self):
         invalid_title_sets = (

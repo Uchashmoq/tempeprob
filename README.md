@@ -11,6 +11,11 @@ pip install pandas requests numpy rpy2 bottle
 The read-only Bottle dashboard scans
 `prediction/highest_temperature_emos/*/*/predictions.jsonl` on every request,
 so newly appended prediction revisions appear after a page refresh.
+It also fetches each visible Polymarket event's current `Yes` prices through
+the public Gamma API and compares them with the EMOS interval probabilities.
+Quotes are server-side snapshots cached for up to five minutes; the page does
+not poll automatically. If Polymarket is unavailable, saved model predictions
+remain visible and the market columns show an unavailable status.
 
 ```bash
 venv/bin/python web_server.py

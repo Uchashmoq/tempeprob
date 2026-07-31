@@ -477,6 +477,131 @@ a:focus-visible {
   background: var(--accent);
 }
 
+.probability-comparison-header,
+.probability-values {
+  display: grid;
+  grid-template-columns: minmax(92px, 1fr) 64px 70px 68px;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.probability-comparison-header {
+  margin-bottom: 7px;
+  padding: 0 0 7px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.probability-comparison-header span:not(:first-child) {
+  text-align: right;
+}
+
+.comparison-list {
+  gap: 10px;
+}
+
+.comparison-row {
+  min-width: 0;
+}
+
+.probability-values {
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.comparison-temperature {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.comparison-number {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.comparison-row.is-peak .comparison-temperature,
+.comparison-row.is-peak .model-number {
+  color: var(--accent);
+  font-weight: 750;
+}
+
+.market-number {
+  color: var(--teal);
+}
+
+.difference-number {
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.difference-number.is-positive {
+  color: #176b65;
+}
+
+.difference-number.is-negative {
+  color: #b5552a;
+}
+
+.difference-number.is-neutral {
+  color: var(--muted);
+}
+
+.probability-bars {
+  display: grid;
+  gap: 3px;
+}
+
+.probability-bars .probability-track {
+  height: 3px;
+}
+
+.probability-track.is-model span {
+  background: var(--accent);
+}
+
+.probability-track.is-market span,
+.probability-row.is-peak .probability-track.is-market span {
+  background: var(--teal);
+}
+
+.comparison-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px 13px;
+  margin-top: 13px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.comparison-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.legend-swatch {
+  display: inline-block;
+  width: 13px;
+  height: 3px;
+  border-radius: 99px;
+}
+
+.legend-swatch.is-model {
+  background: var(--accent);
+}
+
+.legend-swatch.is-market {
+  background: var(--teal);
+}
+
 .card-metadata {
   display: grid;
   gap: 8px;
@@ -655,12 +780,31 @@ a:focus-visible {
   gap: 13px;
 }
 
-.probability-list-large .probability-label {
+.probability-comparison-header-large,
+.probability-values-large {
+  grid-template-columns: minmax(120px, 1fr) 88px 88px 86px;
+  gap: 14px;
+}
+
+.probability-comparison-header-large {
+  font-size: 10px;
+}
+
+.probability-values-large {
+  margin-bottom: 7px;
   font-size: 12px;
 }
 
+.probability-list-large .difference-number {
+  font-size: 11px;
+}
+
+.probability-list-large .probability-bars {
+  gap: 4px;
+}
+
 .probability-list-large .probability-track {
-  height: 7px;
+  height: 5px;
 }
 
 .external-link {
@@ -953,8 +1097,45 @@ a:focus-visible {
     gap: 14px;
   }
 
+  .probability-comparison-header-large,
+  .probability-values-large {
+    grid-template-columns: minmax(94px, 1fr) 68px 68px 70px;
+    gap: 8px;
+  }
+
   .footer-inner {
     flex-direction: column;
+  }
+}
+
+@media (max-width: 430px) {
+  .prediction-card,
+  .detail-panel {
+    padding: 16px;
+  }
+
+  .probability-comparison-header,
+  .probability-values,
+  .probability-comparison-header-large,
+  .probability-values-large {
+    grid-template-columns: minmax(74px, 1fr) 52px 57px 61px;
+    gap: 5px;
+  }
+
+  .probability-comparison-header,
+  .probability-comparison-header-large,
+  .probability-values,
+  .probability-values-large {
+    font-size: 9px;
+  }
+
+  .probability-list-large .difference-number,
+  .difference-number {
+    font-size: 8px;
+  }
+
+  .comparison-legend {
+    gap-inline: 9px;
   }
 }
 
