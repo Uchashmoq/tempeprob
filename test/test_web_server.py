@@ -4,6 +4,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock, patch
 from urllib.parse import quote
 from wsgiref.util import setup_testing_defaults
 
@@ -12,6 +13,7 @@ from web_server import (
     PREDICTION_RECORD_TYPE,
     create_app,
     load_prediction_catalog,
+    main,
 )
 
 
@@ -318,6 +320,59 @@ class WebServerRouteTest(unittest.TestCase):
         self.assertIn("暂无符合条件的预测", dashboard)
         self.assertTrue(missing_status.startswith("404"))
         self.assertIn("没有找到该预测版本", missing_page)
+
+
+class WebServerCommandTest(unittest.TestCase):
+    def test_collect_option_starts_background_collectors_before_server(self):
+        bottle_app = MagicMock()
+
+        with (
+            patch(
+                "web_server.create_app",
+                return_value=bottle_app,
+            ) as create,
+            patch(
+                "web_server._start_background_collection",
+            ) as start_collection,
+            patch("web_server.logging.basicConfig") as configure_logging,
+        ):
+            main(
+                [
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "9000",
+                    "--prediction-dir",
+                    "custom-predictions",
+                    "--collect",
+                ]
+            )
+
+        create.assert_called_once_with(Path("custom-predictions"))
+        configure_logging.assert_called_once()
+        start_collection.assert_called_once_with()
+        bottle_app.run.assert_called_once_with(
+            host="0.0.0.0",
+            port=9000,
+            debug=False,
+            reloader=False,
+        )
+
+    def test_collectors_are_not_started_without_option(self):
+        bottle_app = MagicMock()
+
+        with (
+            patch(
+                "web_server.create_app",
+                return_value=bottle_app,
+            ),
+            patch(
+                "web_server._start_background_collection",
+            ) as start_collection,
+        ):
+            main([])
+
+        start_collection.assert_not_called()
 
 
 if __name__ == "__main__":

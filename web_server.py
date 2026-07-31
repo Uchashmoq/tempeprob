@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass, replace
@@ -24,9 +25,7 @@ from bottle import (
 )
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DEFAULT_PREDICTION_DIR = (
-    PROJECT_DIR / "prediction" / "highest_temperature_emos"
-)
+DEFAULT_PREDICTION_DIR = PROJECT_DIR / "prediction" / "highest_temperature_emos"
 TEMPLATE_DIR = PROJECT_DIR / "web" / "templates"
 STATIC_DIR = PROJECT_DIR / "web" / "static"
 
@@ -382,9 +381,7 @@ def _parse_target_date(value: Any) -> date:
     try:
         parsed = date.fromisoformat(text)
     except ValueError as error:
-        raise PredictionDataError(
-            "target_date_local must use YYYY-MM-DD"
-        ) from error
+        raise PredictionDataError("target_date_local must use YYYY-MM-DD") from error
     if parsed.isoformat() != text:
         raise PredictionDataError("target_date_local must use YYYY-MM-DD")
     return parsed
@@ -400,11 +397,9 @@ def _parse_intervals(value: Any) -> tuple[IntervalView, ...]:
             raise PredictionDataError(f"intervals[{index}] must be an object")
         raw_probability = raw_interval.get("probability")
         if isinstance(raw_probability, bool):
-            raise PredictionDataError(
-                f"intervals[{index}].probability must be numeric"
-            )
+            raise PredictionDataError(f"intervals[{index}].probability must be numeric")
         try:
-            probability = float(raw_probability)
+            probability = float(raw_probability)  # type: ignore
         except (TypeError, ValueError) as error:
             raise PredictionDataError(
                 f"intervals[{index}].probability must be numeric"
@@ -460,15 +455,11 @@ def _parse_market_boundaries(value: Any) -> tuple[float, ...]:
         raise PredictionDataError("market must be an object")
     raw_boundaries = value.get("boundaries")
     if not isinstance(raw_boundaries, list) or not raw_boundaries:
-        raise PredictionDataError(
-            "market.boundaries must be a non-empty list"
-        )
+        raise PredictionDataError("market.boundaries must be a non-empty list")
     boundaries = []
     for index, raw_boundary in enumerate(raw_boundaries):
         if isinstance(raw_boundary, bool):
-            raise PredictionDataError(
-                f"market.boundaries[{index}] must be numeric"
-            )
+            raise PredictionDataError(f"market.boundaries[{index}] must be numeric")
         try:
             boundary = float(raw_boundary)
         except (TypeError, ValueError) as error:
@@ -476,17 +467,12 @@ def _parse_market_boundaries(value: Any) -> tuple[float, ...]:
                 f"market.boundaries[{index}] must be numeric"
             ) from error
         if not math.isfinite(boundary):
-            raise PredictionDataError(
-                f"market.boundaries[{index}] must be finite"
-            )
+            raise PredictionDataError(f"market.boundaries[{index}] must be finite")
         boundaries.append(boundary)
     if any(
-        current <= previous
-        for previous, current in zip(boundaries, boundaries[1:])
+        current <= previous for previous, current in zip(boundaries, boundaries[1:])
     ):
-        raise PredictionDataError(
-            "market.boundaries must be strictly increasing"
-        )
+        raise PredictionDataError("market.boundaries must be strictly increasing")
     return tuple(boundaries)
 
 
@@ -511,9 +497,7 @@ def _parse_prediction_record(
     city_name = _require_string(value.get("city_name"), "city_name")
     model_name = _require_string(value.get("model_name"), "model_name")
     if city_name != expected_city or model_name != expected_model:
-        raise PredictionDataError(
-            "record city/model does not match its directory"
-        )
+        raise PredictionDataError("record city/model does not match its directory")
     city_timezone = _require_string(
         value.get("city_timezone"),
         "city_timezone",
@@ -581,9 +565,7 @@ def load_prediction_catalog(
         try:
             resolved_path = path.resolve(strict=True)
         except OSError as error:
-            issues.append(
-                DataIssue(source, None, f"cannot resolve file: {error}")
-            )
+            issues.append(DataIssue(source, None, f"cannot resolve file: {error}"))
             continue
         if not resolved_path.is_relative_to(resolved_root):
             issues.append(
@@ -610,13 +592,9 @@ def load_prediction_catalog(
                         json.JSONDecodeError,
                         PredictionDataError,
                     ) as error:
-                        issues.append(
-                            DataIssue(source, line_number, str(error))
-                        )
+                        issues.append(DataIssue(source, line_number, str(error)))
                         continue
-                    next_revision = (
-                        revision_counts.get(record.series_key, 0) + 1
-                    )
+                    next_revision = revision_counts.get(record.series_key, 0) + 1
                     revision_counts[record.series_key] = next_revision
                     records.append(replace(record, revision=next_revision))
         except (OSError, UnicodeError) as error:
@@ -634,9 +612,7 @@ def _format_in_timezone(value: datetime, timezone_name: str) -> str:
         target_timezone = ZoneInfo(timezone_name)
     except (ValueError, ZoneInfoNotFoundError):
         target_timezone = timezone.utc
-    return value.astimezone(target_timezone).strftime(
-        "%Y-%m-%d %H:%M:%S %Z"
-    )
+    return value.astimezone(target_timezone).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def _format_record_time(value: Any, timezone_name: str) -> str:
@@ -693,9 +669,7 @@ def _dashboard_groups(
                 by_date[target_date][city_name],
                 key=lambda record: record.model_name,
             )
-            boundaries = {
-                record.market_boundaries for record in city_records
-            }
+            boundaries = {record.market_boundaries for record in city_records}
             city_groups.append(
                 {
                     "city_name": city_name,
@@ -704,9 +678,7 @@ def _dashboard_groups(
                     "records": [
                         {
                             "record": record,
-                            "history_count": history_counts[
-                                record.series_key
-                            ],
+                            "history_count": history_counts[record.series_key],
                         }
                         for record in city_records
                     ],
@@ -717,8 +689,7 @@ def _dashboard_groups(
             {
                 "target_date": target_date.isoformat(),
                 "target_date_label": (
-                    f"{target_date:%Y-%m-%d} "
-                    f"{_WEEKDAYS_ZH[target_date.weekday()]}"
+                    f"{target_date:%Y-%m-%d} " f"{_WEEKDAYS_ZH[target_date.weekday()]}"
                 ),
                 "cities": city_groups,
             }
@@ -754,26 +725,22 @@ def _render_dashboard(
     active_city: str | None = None,
 ) -> str:
     selected_city = active_city or _validated_filter(
-        request.query.get("city", ""),
+        request.query.get("city", ""),  # type: ignore
         catalog.cities,
     )
     selected_model = _validated_filter(
-        request.query.get("model", ""),
+        request.query.get("model", ""),  # type: ignore
         catalog.models,
     )
     selected_date = _validated_filter(
-        request.query.get("date", ""),
+        request.query.get("date", ""),  # type: ignore
         catalog.dates,
     )
     records = list(catalog.latest_records)
     if selected_city is not None:
-        records = [
-            record for record in records if record.city_name == selected_city
-        ]
+        records = [record for record in records if record.city_name == selected_city]
     if selected_model is not None:
-        records = [
-            record for record in records if record.model_name == selected_model
-        ]
+        records = [record for record in records if record.model_name == selected_model]
     if selected_date is not None:
         records = [
             record
@@ -796,12 +763,8 @@ def _render_dashboard(
         selected_city=selected_city,
         selected_model=selected_model,
         selected_date=selected_date,
-        city_options=[
-            (city, _city_label(city)) for city in catalog.cities
-        ],
-        model_options=[
-            (model, _model_label(model)) for model in catalog.models
-        ],
+        city_options=[(city, _city_label(city)) for city in catalog.cities],
+        model_options=[(model, _model_label(model)) for model in catalog.models],
         date_options=catalog.dates,
         **_base_context(
             catalog,
@@ -835,11 +798,11 @@ def create_app(
             "frame-ancestors 'none'; form-action 'self'",
         )
 
-    @bottle_app.get("/")
+    @bottle_app.get("/")  # type: ignore
     def dashboard() -> str:
         return _render_dashboard(load_prediction_catalog(prediction_root))
 
-    @bottle_app.get("/city/<city_name>")
+    @bottle_app.get("/city/<city_name>")  # type: ignore
     def city_dashboard(city_name: str) -> str:
         catalog = load_prediction_catalog(prediction_root)
         if city_name not in catalog.cities:
@@ -847,7 +810,7 @@ def create_app(
         return _render_dashboard(catalog, active_city=city_name)
 
     @bottle_app.get(
-        "/prediction/<city_name>/<model_name>/<target_date>/<revision:int>"
+        "/prediction/<city_name>/<model_name>/<target_date>/<revision:int>"  # type: ignore
     )
     def prediction_detail(
         city_name: str,
@@ -864,7 +827,7 @@ def create_app(
         )
         if record is None:
             abort(404, "没有找到该预测版本")
-        history = tuple(reversed(catalog.history_for(record)))
+        history = tuple(reversed(catalog.history_for(record)))  # type: ignore
         return template(
             "detail",
             template_lookup=[str(TEMPLATE_DIR)],
@@ -873,20 +836,20 @@ def create_app(
             history=history,
             **_base_context(
                 catalog,
-                page_title=f"{record.city_label} · {record.target_date_label}",
-                active_city=record.city_name,
+                page_title=f"{record.city_label} · {record.target_date_label}",  # type: ignore
+                active_city=record.city_name,  # type: ignore
             ),
         )
 
-    @bottle_app.get("/assets/app.css")
+    @bottle_app.get("/assets/app.css")  # type: ignore
     def stylesheet():
         return static_file(
             "app.css",
             root=str(STATIC_DIR),
-            mimetype="text/css",
+            mimetype="text/css",  # type: ignore
         )
 
-    @bottle_app.get("/healthz")
+    @bottle_app.get("/healthz")  # type: ignore
     def health() -> str:
         catalog = load_prediction_catalog(prediction_root)
         response.content_type = "application/json"
@@ -902,7 +865,7 @@ def create_app(
             separators=(",", ":"),
         )
 
-    @bottle_app.error(404)
+    @bottle_app.error(404)  # type: ignore
     def not_found(error: HTTPError) -> str:
         catalog = load_prediction_catalog(prediction_root)
         return template(
@@ -923,6 +886,13 @@ def create_app(
 app = create_app()
 
 
+def _start_background_collection() -> None:
+    """Start collectors lazily so normal dashboard imports stay lightweight."""
+    from collect import start_collection_threads
+
+    start_collection_threads(daemon=True)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Serve the saved EMOS prediction dashboard.",
@@ -934,8 +904,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         type=Path,
         default=DEFAULT_PREDICTION_DIR,
     )
+    parser.add_argument(
+        "--collect",
+        action="store_true",
+        help=(
+            "collect forecast and temperature data in background threads "
+            "while serving the dashboard"
+        ),
+    )
     arguments = parser.parse_args(argv)
-    create_app(arguments.prediction_dir).run(
+    bottle_app = create_app(arguments.prediction_dir)
+    if arguments.collect:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        _start_background_collection()
+    bottle_app.run(
         host=arguments.host,
         port=arguments.port,
         debug=False,

@@ -25,6 +25,16 @@ venv/bin/python web_server.py \
   --prediction-dir prediction/highest_temperature_emos
 ```
 
+Add `--collect` to run the forecast and temperature collectors in background
+threads owned by the dashboard process:
+
+```bash
+venv/bin/python web_server.py --collect
+```
+
+Do not run `collect.py` separately at the same time, or the two processes may
+attempt to collect and append the same updates.
+
 For a public deployment, expose the Bottle WSGI application through a
 production server instead of the built-in development server:
 
