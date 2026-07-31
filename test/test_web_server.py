@@ -373,6 +373,12 @@ class WebServerCommandTest(unittest.TestCase):
             main([])
 
         start_collection.assert_not_called()
+        bottle_app.run.assert_called_once_with(
+            host="0.0.0.0",
+            port=8001,
+            debug=False,
+            reloader=False,
+        )
 
 
 if __name__ == "__main__":

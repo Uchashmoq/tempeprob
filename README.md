@@ -16,14 +16,19 @@ so newly appended prediction revisions appear after a page refresh.
 venv/bin/python web_server.py
 ```
 
-Open <http://127.0.0.1:8001>. Optional arguments:
+The built-in server listens on all network interfaces by default. Open
+`http://SERVER_IP:8001`, or <http://127.0.0.1:8001> from the server itself.
+Optional arguments:
 
 ```bash
 venv/bin/python web_server.py \
-  --host 127.0.0.1 \
+  --host 0.0.0.0 \
   --port 8001 \
   --prediction-dir prediction/highest_temperature_emos
 ```
+
+Use `--host 127.0.0.1` when the dashboard should only be reachable locally or
+through a reverse proxy.
 
 Add `--collect` to run the forecast and temperature collectors in background
 threads owned by the dashboard process:

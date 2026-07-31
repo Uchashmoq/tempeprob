@@ -897,7 +897,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Serve the saved EMOS prediction dashboard.",
     )
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="listen address (default: 0.0.0.0, all network interfaces)",
+    )
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument(
         "--prediction-dir",
