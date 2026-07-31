@@ -3,7 +3,7 @@
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install pandas requests numpy rpy2
+pip install pandas requests numpy rpy2 bottle
 ```
 
 ## Init R Package
