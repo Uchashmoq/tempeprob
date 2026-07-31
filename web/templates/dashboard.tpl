@@ -32,6 +32,41 @@
   </dl>
 </section>
 
+% if latest_temperature_cards:
+<section class="latest-observations" aria-labelledby="latest-observations-title">
+  <header class="latest-observations-heading">
+    <div>
+      <p class="section-kicker">LATEST OBSERVATIONS</p>
+      <h2 id="latest-observations-title">最新温度</h2>
+    </div>
+  </header>
+  <div class="latest-observations-grid">
+    % for observation in latest_temperature_cards:
+    <article class="latest-observation-card{{'' if observation['available'] else ' is-unavailable'}}">
+      <header>
+        <a href="{{observation['city_url']}}">{{observation["city_label"]}}</a>
+        <span>METAR</span>
+      </header>
+      <strong class="latest-observation-value">
+        {{observation["temperature_text"]}}
+      </strong>
+      <div class="latest-observation-published">
+        <span>发布时间</span>
+        % if observation["available"]:
+        <time
+          datetime="{{observation['published_at_iso']}}"
+          title="观测时间：{{observation['observed_at_text']}}"
+        >{{observation["published_at_text"]}}</time>
+        % else:
+        <span>暂无观测</span>
+        % end
+      </div>
+    </article>
+    % end
+  </div>
+</section>
+% end
+
 <section class="filter-panel" aria-label="筛选预测">
   <form class="filters" action="/" method="get">
     <label>

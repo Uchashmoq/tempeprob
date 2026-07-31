@@ -13,6 +13,7 @@ from web_server import (
     PREDICTION_RECORD_TYPE,
     PolymarketPriceCache,
     create_app,
+    load_latest_temperature_observations,
     load_prediction_catalog,
     main,
 )
@@ -166,6 +167,21 @@ def write_records(
     return path
 
 
+def write_temperatures(
+    root: Path,
+    records: list[dict],
+    *,
+    city_name: str = CITY,
+) -> Path:
+    path = root / city_name / "tem.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as output_file:
+        for record in records:
+            json.dump(record, output_file, ensure_ascii=False)
+            output_file.write("\n")
+    return path
+
+
 def wsgi_get(app, path: str, query: str = ""):
     environ = {}
     setup_testing_defaults(environ)
@@ -295,6 +311,83 @@ class PredictionCatalogTest(unittest.TestCase):
         self.assertFalse(catalog.records)
         self.assertEqual(len(catalog.issues), 1)
         self.assertIn("outside prediction root", catalog.issues[0].message)
+
+
+class TemperatureObservationTest(unittest.TestCase):
+    def test_loader_selects_latest_observation_and_newest_publication(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            path = write_temperatures(
+                root,
+                [
+                    {
+                        "temperature": 31,
+                        "time": 1785470400,
+                        "update_time": 1785470700,
+                    },
+                    {
+                        "temperature": 99,
+                        "time": 1785466800,
+                        "update_time": 1785474000,
+                    },
+                    {
+                        "temperature": 32.5,
+                        "time": 1785470400,
+                        "update_time": 1785470760,
+                    },
+                ],
+            )
+            with path.open("a", encoding="utf-8") as output_file:
+                output_file.write('{"temperature":')
+
+            observations = load_latest_temperature_observations(
+                root,
+                (CITY,),
+            )
+
+        self.assertEqual(set(observations), {CITY})
+        observation = observations[CITY]
+        self.assertEqual(observation.temperature_celsius, 32.5)
+        self.assertEqual(observation.temperature_text, "32.5°C")
+        self.assertEqual(observation.line_number, 3)
+
+    def test_dashboard_displays_temperature_and_local_publication_time(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            prediction_root = root / "predictions"
+            temperature_root = root / "temperature"
+            write_records(prediction_root, [make_record()])
+            write_temperatures(
+                temperature_root,
+                [
+                    {
+                        "temperature": 32.5,
+                        "time": 1785470400,
+                        "update_time": 1785470760,
+                    }
+                ],
+            )
+            market_price_cache, _ = make_market_price_cache()
+            app = create_app(
+                prediction_root,
+                temperature_dir=temperature_root,
+                market_price_cache=market_price_cache,
+            )
+
+            status, _, dashboard = wsgi_get(app, "/")
+            city_status, _, city_page = wsgi_get(
+                app,
+                f"/city/{quote(CITY, safe='')}",
+            )
+
+        self.assertTrue(status.startswith("200"))
+        self.assertTrue(city_status.startswith("200"))
+        for page in (dashboard, city_page):
+            self.assertIn("最新温度", page)
+            self.assertIn("32.5°C", page)
+            self.assertIn("发布时间", page)
+            self.assertIn("2026-07-31 12:06:00 CST", page)
+            self.assertIn("观测时间：2026-07-31 12:00:00 CST", page)
 
 
 class WebServerRouteTest(unittest.TestCase):

@@ -199,6 +199,107 @@ select {
   letter-spacing: -0.04em;
 }
 
+.latest-observations {
+  margin-bottom: 18px;
+  padding: 17px 18px 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.latest-observations-heading {
+  margin-bottom: 12px;
+}
+
+.latest-observations-heading .section-kicker {
+  margin-bottom: 4px;
+}
+
+.latest-observations-heading h2 {
+  margin: 0;
+  font-size: 19px;
+  letter-spacing: -0.025em;
+}
+
+.latest-observations-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 10px;
+}
+
+.latest-observation-card {
+  min-width: 0;
+  padding: 13px 14px;
+  border: 1px solid #cfe1de;
+  border-radius: 9px;
+  background: var(--teal-soft);
+}
+
+.latest-observation-card header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.latest-observation-card header a {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.latest-observation-card header a:hover {
+  color: var(--teal);
+}
+
+.latest-observation-card header span {
+  flex: 0 0 auto;
+  color: var(--teal);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+}
+
+.latest-observation-value {
+  display: block;
+  margin-top: 9px;
+  font-size: 27px;
+  line-height: 1;
+  letter-spacing: -0.045em;
+}
+
+.latest-observation-published {
+  display: grid;
+  gap: 2px;
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.latest-observation-published > span:first-child {
+  color: #54736f;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.latest-observation-published time {
+  overflow-wrap: anywhere;
+}
+
+.latest-observation-card.is-unavailable {
+  border-color: var(--line);
+  background: #f6f7f7;
+}
+
+.latest-observation-card.is-unavailable .latest-observation-value {
+  color: var(--muted);
+}
+
 .filter-panel {
   margin-bottom: 26px;
   padding: 17px 18px;

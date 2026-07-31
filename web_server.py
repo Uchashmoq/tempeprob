@@ -37,6 +37,7 @@ from polymarket import (
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_PREDICTION_DIR = PROJECT_DIR / "prediction" / "highest_temperature_emos"
+DEFAULT_TEMPERATURE_DIR = PROJECT_DIR / "data" / "temperature"
 TEMPLATE_DIR = PROJECT_DIR / "web" / "templates"
 STATIC_DIR = PROJECT_DIR / "web" / "static"
 DEFAULT_MARKET_PRICE_TIMEOUT_SECONDS = 5.0
@@ -56,6 +57,10 @@ _MODEL_LABELS = {
 
 class PredictionDataError(ValueError):
     """One JSONL record cannot be displayed safely."""
+
+
+class TemperatureDataError(ValueError):
+    """One saved temperature observation is invalid."""
 
 
 @dataclass(frozen=True)
@@ -205,6 +210,22 @@ class MarketComparisonView:
         return self.unavailable_reason is None and all(
             row.market_yes_price is not None for row in self.rows
         )
+
+
+@dataclass(frozen=True)
+class LatestTemperatureObservation:
+    """Latest valid METAR temperature saved for one configured city."""
+
+    city_name: str
+    temperature_celsius: float
+    observed_at_utc: datetime
+    published_at_utc: datetime
+    source: str
+    line_number: int
+
+    @property
+    def temperature_text(self) -> str:
+        return f"{self.temperature_celsius:g}°C"
 
 
 @dataclass(frozen=True)
@@ -837,6 +858,126 @@ def load_prediction_catalog(
     )
 
 
+def _parse_unix_timestamp(value: Any, field_name: str) -> datetime:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TemperatureDataError(f"{field_name} must be a Unix timestamp")
+    timestamp = float(value)
+    if not math.isfinite(timestamp):
+        raise TemperatureDataError(f"{field_name} must be finite")
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OSError, OverflowError, ValueError) as error:
+        raise TemperatureDataError(
+            f"{field_name} is outside the supported timestamp range"
+        ) from error
+
+
+def _parse_temperature_observation(
+    value: Any,
+    *,
+    city_name: str,
+    source: str,
+    line_number: int,
+) -> LatestTemperatureObservation:
+    if not isinstance(value, Mapping):
+        raise TemperatureDataError("temperature record must be an object")
+    raw_temperature = value.get("temperature")
+    if isinstance(raw_temperature, bool) or not isinstance(
+        raw_temperature,
+        (int, float),
+    ):
+        raise TemperatureDataError("temperature must be numeric")
+    temperature_celsius = float(raw_temperature)
+    if not math.isfinite(temperature_celsius):
+        raise TemperatureDataError("temperature must be finite")
+    observed_at_utc = _parse_unix_timestamp(value.get("time"), "time")
+    published_at_utc = _parse_unix_timestamp(
+        value.get("update_time"),
+        "update_time",
+    )
+    if published_at_utc < observed_at_utc:
+        raise TemperatureDataError("update_time must not precede time")
+    return LatestTemperatureObservation(
+        city_name=city_name,
+        temperature_celsius=temperature_celsius,
+        observed_at_utc=observed_at_utc,
+        published_at_utc=published_at_utc,
+        source=source,
+        line_number=line_number,
+    )
+
+
+def load_latest_temperature_observations(
+    temperature_dir: str | Path = DEFAULT_TEMPERATURE_DIR,
+    city_names: Sequence[str] = (),
+) -> dict[str, LatestTemperatureObservation]:
+    """Load each requested city's newest valid saved temperature.
+
+    Files are scanned because collection history may contain duplicate or
+    out-of-order records.  Ordering by observation time, publication time and
+    line number matches the append-only data semantics while tolerating an
+    incomplete line being written concurrently.
+    """
+    root = Path(temperature_dir)
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError:
+        return {}
+    if not resolved_root.is_dir():
+        return {}
+
+    observations: dict[str, LatestTemperatureObservation] = {}
+    for city_name in sorted(set(city_names)):
+        if not isinstance(city_name, str) or Path(city_name).name != city_name:
+            continue
+        path = resolved_root / city_name / "tem.jsonl"
+        source = f"{city_name}/tem.jsonl"
+        try:
+            resolved_path = path.resolve(strict=True)
+        except OSError:
+            continue
+        if (
+            not resolved_path.is_file()
+            or not resolved_path.is_relative_to(resolved_root)
+        ):
+            continue
+
+        latest: LatestTemperatureObservation | None = None
+        try:
+            with resolved_path.open("r", encoding="utf-8") as input_file:
+                for line_number, line in enumerate(input_file, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        candidate = _parse_temperature_observation(
+                            json.loads(line),
+                            city_name=city_name,
+                            source=source,
+                            line_number=line_number,
+                        )
+                    except (
+                        json.JSONDecodeError,
+                        TemperatureDataError,
+                    ):
+                        continue
+                    candidate_key = (
+                        candidate.observed_at_utc,
+                        candidate.published_at_utc,
+                        candidate.line_number,
+                    )
+                    if latest is None or candidate_key > (
+                        latest.observed_at_utc,
+                        latest.published_at_utc,
+                        latest.line_number,
+                    ):
+                        latest = candidate
+        except (OSError, UnicodeError):
+            continue
+        if latest is not None:
+            observations[city_name] = latest
+    return observations
+
+
 def _format_in_timezone(value: datetime, timezone_name: str) -> str:
     try:
         target_timezone = ZoneInfo(timezone_name)
@@ -858,6 +999,50 @@ def _city_label(city_name: str) -> str:
     if len(parts) == 2 and re.fullmatch(r"[A-Z0-9]{4}", parts[1]):
         return f"{parts[0].replace('-', ' ')} · {parts[1]}"
     return city_name.replace("-", " ")
+
+
+def _latest_temperature_cards(
+    records: Sequence[PredictionRecord],
+    observations: Mapping[str, LatestTemperatureObservation],
+) -> list[dict[str, Any]]:
+    latest_record_by_city: dict[str, PredictionRecord] = {}
+    for record in records:
+        current = latest_record_by_city.get(record.city_name)
+        if current is None or record.generated_at_utc > current.generated_at_utc:
+            latest_record_by_city[record.city_name] = record
+
+    cards: list[dict[str, Any]] = []
+    for city_name in sorted(latest_record_by_city):
+        city_record = latest_record_by_city[city_name]
+        observation = observations.get(city_name)
+        card: dict[str, Any] = {
+            "city_name": city_name,
+            "city_label": _city_label(city_name),
+            "city_url": f"/city/{quote(city_name, safe='')}",
+            "available": observation is not None,
+            "temperature_text": "—",
+            "observed_at_text": "暂无观测",
+            "published_at_text": "暂无观测",
+            "published_at_iso": None,
+        }
+        if observation is not None:
+            card.update(
+                {
+                    "temperature_text": observation.temperature_text,
+                    "observed_at_text": _format_in_timezone(
+                        observation.observed_at_utc,
+                        city_record.city_timezone,
+                    ),
+                    "published_at_text": _format_in_timezone(
+                        observation.published_at_utc,
+                        city_record.city_timezone,
+                    ),
+                    "published_at_iso": observation.published_at_utc.isoformat()
+                    .replace("+00:00", "Z"),
+                }
+            )
+        cards.append(card)
+    return cards
 
 
 def _model_label(model_name: str) -> str:
@@ -1045,6 +1230,7 @@ def _render_dashboard(
     catalog: PredictionCatalog,
     *,
     market_price_cache: PolymarketPriceCache,
+    temperature_root: Path,
     active_city: str | None = None,
 ) -> str:
     selected_city = active_city or _validated_filter(
@@ -1080,11 +1266,22 @@ def _render_dashboard(
         records,
         market_price_cache,
     )
+    visible_city_names = tuple(
+        sorted({record.city_name for record in records})
+    )
+    latest_temperatures = load_latest_temperature_observations(
+        temperature_root,
+        visible_city_names,
+    )
     return template(
         "dashboard",
         template_lookup=[str(TEMPLATE_DIR)],
         catalog=catalog,
         groups=_dashboard_groups(records, catalog, market_snapshots),
+        latest_temperature_cards=_latest_temperature_cards(
+            records,
+            latest_temperatures,
+        ),
         latest_count=len(catalog.latest_records),
         visible_count=len(records),
         selected_city=selected_city,
@@ -1104,10 +1301,12 @@ def _render_dashboard(
 def create_app(
     prediction_dir: str | Path = DEFAULT_PREDICTION_DIR,
     *,
+    temperature_dir: str | Path = DEFAULT_TEMPERATURE_DIR,
     market_price_cache: PolymarketPriceCache | None = None,
 ) -> Bottle:
     """Create a read-only Bottle application for one prediction directory."""
     prediction_root = Path(prediction_dir)
+    temperature_root = Path(temperature_dir)
     price_cache = (
         PolymarketPriceCache() if market_price_cache is None else market_price_cache
     )
@@ -1135,6 +1334,7 @@ def create_app(
         return _render_dashboard(
             load_prediction_catalog(prediction_root),
             market_price_cache=price_cache,
+            temperature_root=temperature_root,
         )
 
     @bottle_app.get("/city/<city_name>")  # type: ignore
@@ -1145,6 +1345,7 @@ def create_app(
         return _render_dashboard(
             catalog,
             market_price_cache=price_cache,
+            temperature_root=temperature_root,
             active_city=city_name,
         )
 
