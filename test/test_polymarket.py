@@ -207,6 +207,21 @@ class PolymarketTemperatureBoundariesTest(unittest.TestCase):
                     "2026-07-30",
                 )
 
+    def test_api_error_preserves_http_status_code(self):
+        response = Mock(status_code=404)
+        response.raise_for_status.side_effect = requests.HTTPError(
+            "not found",
+            response=response,
+        )
+        with patch("polymarket.requests.get", return_value=response):
+            with self.assertRaises(PolymarketAPIError) as raised:
+                get_daily_max_temperature_boundaries(
+                    SLUG_PREFIX,
+                    "2026-07-30",
+                )
+
+        self.assertEqual(raised.exception.status_code, 404)
+
     def test_rejects_response_for_a_different_event_slug(self):
         response = Mock()
         response.json.return_value = make_temperature_event(

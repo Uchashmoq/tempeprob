@@ -1,9 +1,11 @@
 """Tests for daily maximum-temperature EMOS prediction."""
 
+import json
 import math
 import unittest
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch, sentinel
 from zoneinfo import ZoneInfo
 
@@ -11,16 +13,22 @@ from predict_emos_max_temperature import (
     _ArtifactGroup,
     _DailyMaxPredictionCase,
     _PredictionUnavailableError,
+    _append_prediction_record,
     _artifact_groups,
     _build_daily_max_prediction_ensemble_data,
+    _build_prediction_record,
     _call_ensemble_mos_cdf,
     _call_ensemble_mos_cdf_values,
+    _emos_parameters_for_date,
     _interval_probabilities_from_cdf,
     _select_daily_max_forecast,
     _validate_interval_boundaries,
+    DailyMaxTemperatureIntervalPrediction,
+    predict_all_configured_daily_max_temperature_intervals,
     predict_daily_max_temperature_intervals,
     probability_daily_max_temperature_below,
 )
+from polymarket import PolymarketAPIError
 from train_emos_max_temperature import DailyMaxTemperatureEmosArtifact
 
 
@@ -92,6 +100,10 @@ def make_artifact(
         "modeled_dates": [modeled_date],
         "member_names": list(MEMBERS),
         "timezone": ZONE.key,
+        "fit_file": f"fits/init_{key[0]}_day_{key[1]:03d}.rds",
+        "fit_sha256": "a" * 64,
+        "resolved_training_days": 14,
+        "sample_count": 20,
     }
     return DailyMaxTemperatureEmosArtifact(
         version="test-version",
@@ -114,6 +126,83 @@ def make_artifact(
                         "minimum_notice_hours": 0.0,
                     }
                 }
+            },
+        },
+    )
+
+
+def make_persistable_prediction(
+    target_date: date,
+    boundaries: tuple[float, ...],
+    *,
+    model_name: str = MODEL,
+    artifact_version: str = "artifact-v1",
+) -> DailyMaxTemperatureIntervalPrediction:
+    cdf_values = tuple(
+        (index + 1) / (len(boundaries) + 1)
+        for index in range(len(boundaries))
+    )
+    intervals = _interval_probabilities_from_cdf(
+        boundaries,
+        cdf_values,
+        "celsius",
+    )
+    initialization_time = timestamp("2026-07-29T12:00:00+00:00")
+    availability_time = timestamp("2026-07-29T20:00:00+00:00")
+    return DailyMaxTemperatureIntervalPrediction(
+        target_date=target_date,
+        intervals=intervals,
+        provenance={
+            "city_timezone": ZONE.key,
+            "forecast": {
+                "initialization_time_unix": initialization_time,
+                "initialization_time_utc": "2026-07-29T12:00:00.000000Z",
+                "availability_time_unix": availability_time,
+                "availability_time_utc": "2026-07-29T20:00:00.000000Z",
+                "initialization_hour_utc": "12",
+                "day_ahead": 2,
+                "meta": {
+                    "last_run_initialisation_time": initialization_time,
+                    "last_run_availability_time": availability_time,
+                },
+                "member_names": list(MEMBERS),
+                "daily_member_maxima": [39.0, 40.0],
+                "input_unit": "celsius",
+                "predictor_sha256": "b" * 64,
+            },
+            "emos_artifact": {
+                "version": artifact_version,
+                "path": (
+                    f"train/highest_temperature_emos/{CITY}/"
+                    f"{model_name}/{artifact_version}"
+                ),
+                "training_completed_at_utc": "2026-07-30T00:00:00Z",
+                "saved_at_utc": "2026-07-30T00:00:01Z",
+                "parameter_date": target_date.strftime("%Y%m%d"),
+                "correction_parameters": {
+                    "model": "normal",
+                    "parameter_date": target_date.strftime("%Y%m%d"),
+                    "a": 1.0,
+                    "B_by_member": {
+                        MEMBERS[0]: 0.6,
+                        MEMBERS[1]: 0.4,
+                    },
+                    "c": 2.0,
+                    "d": 0.5,
+                },
+                "group": {
+                    "initialization_hour_utc": "12",
+                    "day_ahead": 2,
+                    "forecast_hour": 48,
+                    "fit_file": "fits/init_12_day_002.rds",
+                    "fit_sha256": "a" * 64,
+                    "resolved_training_days": 14,
+                    "sample_count": 20,
+                },
+            },
+            "options": {
+                "expected_interval_seconds": 3600,
+                "minimum_notice_hours": 0.0,
             },
         },
     )
@@ -408,6 +497,161 @@ class DailyMaxTemperatureProbabilityTest(unittest.TestCase):
         self.assertAlmostEqual(cdf.call_args.args[2], 303.15)
         self.assertEqual(cdf.call_args.args[3], target)
 
+    def test_interval_prediction_includes_selected_forecast_and_fit_provenance(self):
+        target = date(2026, 1, 3)
+        initialization_time = timestamp("2026-01-01T12:00:00+00:00")
+        availability_time = timestamp("2026-01-01T20:00:00+00:00")
+        forecast = make_forecast(
+            initialization_time,
+            availability_time,
+            local_day_timestamps(target),
+        )
+        artifact = make_artifact()
+
+        with (
+            patch(
+                "predict_emos_max_temperature."
+                "load_daily_max_temperature_emos_fits",
+                return_value=artifact,
+            ),
+            patch(
+                "predict_emos_max_temperature._load_forecasts",
+                return_value=[forecast],
+            ),
+            patch(
+                "predict_emos_max_temperature."
+                "_build_daily_max_prediction_ensemble_data",
+                return_value=sentinel.ensemble_data,
+            ),
+            patch(
+                "predict_emos_max_temperature."
+                "_call_ensemble_mos_cdf_values",
+                return_value=(0.25, 0.75),
+            ),
+            patch(
+                "predict_emos_max_temperature."
+                "_emos_parameters_for_date",
+                return_value={
+                    "model": "normal",
+                    "parameter_date": "20260103",
+                    "a": 1.0,
+                    "B_by_member": {
+                        MEMBERS[0]: 0.6,
+                        MEMBERS[1]: 0.4,
+                    },
+                    "c": 2.0,
+                    "d": 0.5,
+                },
+            ),
+        ):
+            predictions = predict_daily_max_temperature_intervals(
+                CITY,
+                MODEL,
+                (30.0, 31.0),
+                start_date=target,
+                days=1,
+                as_of=datetime(2026, 1, 2, 12, tzinfo=timezone.utc),
+                artifact_version="version-1",
+                include_provenance=True,
+            )
+
+        provenance = predictions[0].provenance
+        self.assertIsInstance(provenance, dict)
+        self.assertEqual(
+            provenance["forecast"]["initialization_time_unix"],
+            initialization_time,
+        )
+        self.assertEqual(
+            provenance["forecast"]["availability_time_unix"],
+            availability_time,
+        )
+        self.assertEqual(
+            provenance["forecast"]["meta"],
+            forecast["meta"],
+        )
+        self.assertEqual(
+            provenance["emos_artifact"]["version"],
+            "test-version",
+        )
+        self.assertEqual(
+            provenance["emos_artifact"]["group"]["fit_sha256"],
+            "a" * 64,
+        )
+        self.assertEqual(
+            provenance["emos_artifact"]["parameter_date"],
+            "20260103",
+        )
+        self.assertEqual(
+            provenance["emos_artifact"]["correction_parameters"]["a"],
+            1.0,
+        )
+
+    def test_extracts_exact_emos_parameter_column_for_target_date(self):
+        class Matrix(list):
+            def __init__(
+                self,
+                values,
+                dimensions,
+                column_names,
+                row_names,
+            ):
+                super().__init__(values)
+                self.dim = dimensions
+                self.colnames = column_names
+                self.rownames = row_names
+
+        class Fit:
+            parameters = {
+                "a": Matrix(
+                    [1.0, 2.0],
+                    (1, 2),
+                    ("20260102", "20260103"),
+                    ("a",),
+                ),
+                "B": Matrix(
+                    [0.1, 0.2, 0.3, 0.4],
+                    (2, 2),
+                    ("20260102", "20260103"),
+                    MEMBERS,
+                ),
+                "c": Matrix(
+                    [3.0, 4.0],
+                    (1, 2),
+                    ("20260102", "20260103"),
+                    ("c",),
+                ),
+                "d": Matrix(
+                    [0.5, 0.6],
+                    (1, 2),
+                    ("20260102", "20260103"),
+                    ("d",),
+                ),
+            }
+
+            def rx2(self, name):
+                return self.parameters[name]
+
+        parameters = _emos_parameters_for_date(
+            Fit(),
+            date(2026, 1, 3),
+            MEMBERS,
+        )
+
+        self.assertEqual(
+            parameters,
+            {
+                "model": "normal",
+                "parameter_date": "20260103",
+                "a": 2.0,
+                "B_by_member": {
+                    MEMBERS[0]: 0.3,
+                    MEMBERS[1]: 0.4,
+                },
+                "c": 4.0,
+                "d": 0.6,
+            },
+        )
+
     def test_rejects_artifact_created_after_as_of(self):
         artifact = make_artifact(
             training_completed_at="2026-01-02T13:00:00Z"
@@ -650,6 +894,420 @@ class DailyMaxTemperatureIntervalProbabilityTest(unittest.TestCase):
             predictions[2].unavailable_reason,
             "missing modeled date",
         )
+
+
+class DailyMaxTemperaturePredictionPersistenceTest(unittest.TestCase):
+    def test_prediction_record_append_is_idempotent_and_versioned(self):
+        target = date(2026, 7, 31)
+        boundaries = (38.0, 39.0)
+        first_prediction = make_persistable_prediction(
+            target,
+            boundaries,
+        )
+        first_record = _build_prediction_record(
+            CITY,
+            MODEL,
+            "highest-temperature-in-chongqing",
+            "highest-temperature-in-chongqing-on-july-31-2026",
+            boundaries,
+            first_prediction,
+            generated_at=datetime(
+                2026,
+                7,
+                30,
+                12,
+                tzinfo=timezone.utc,
+            ),
+            as_of=datetime(
+                2026,
+                7,
+                30,
+                11,
+                tzinfo=timezone.utc,
+            ),
+            market_fetched_at=datetime(
+                2026,
+                7,
+                30,
+                11,
+                30,
+                tzinfo=timezone.utc,
+            ),
+        )
+        second_record = _build_prediction_record(
+            CITY,
+            MODEL,
+            "highest-temperature-in-chongqing",
+            "highest-temperature-in-chongqing-on-july-31-2026",
+            boundaries,
+            make_persistable_prediction(
+                target,
+                boundaries,
+                artifact_version="artifact-v2",
+            ),
+            generated_at=datetime(
+                2026,
+                7,
+                30,
+                13,
+                tzinfo=timezone.utc,
+            ),
+            as_of=datetime(
+                2026,
+                7,
+                30,
+                12,
+                tzinfo=timezone.utc,
+            ),
+            market_fetched_at=datetime(
+                2026,
+                7,
+                30,
+                12,
+                30,
+                tzinfo=timezone.utc,
+            ),
+        )
+        changed_prediction = DailyMaxTemperatureIntervalPrediction(
+            target_date=target,
+            intervals=_interval_probabilities_from_cdf(
+                boundaries,
+                (0.2, 0.8),
+                "celsius",
+            ),
+            provenance=first_prediction.provenance,
+        )
+        changed_record = _build_prediction_record(
+            CITY,
+            MODEL,
+            "highest-temperature-in-chongqing",
+            "highest-temperature-in-chongqing-on-july-31-2026",
+            boundaries,
+            changed_prediction,
+            generated_at=datetime(
+                2026,
+                7,
+                30,
+                14,
+                tzinfo=timezone.utc,
+            ),
+            as_of=datetime(
+                2026,
+                7,
+                30,
+                13,
+                tzinfo=timezone.utc,
+            ),
+            market_fetched_at=datetime(
+                2026,
+                7,
+                30,
+                13,
+                30,
+                tzinfo=timezone.utc,
+            ),
+        )
+        relocated_provenance = json.loads(
+            json.dumps(first_prediction.provenance)
+        )
+        relocated_provenance["emos_artifact"]["path"] = (
+            "/absolute/elsewhere/artifact-v1"
+        )
+        relocated_record = _build_prediction_record(
+            CITY,
+            MODEL,
+            "highest-temperature-in-chongqing",
+            "highest-temperature-in-chongqing-on-july-31-2026",
+            boundaries,
+            DailyMaxTemperatureIntervalPrediction(
+                target_date=target,
+                intervals=first_prediction.intervals,
+                provenance=relocated_provenance,
+            ),
+            generated_at=datetime(
+                2026,
+                7,
+                30,
+                15,
+                tzinfo=timezone.utc,
+            ),
+            as_of=datetime(
+                2026,
+                7,
+                30,
+                14,
+                tzinfo=timezone.utc,
+            ),
+            market_fetched_at=datetime(
+                2026,
+                7,
+                30,
+                14,
+                30,
+                tzinfo=timezone.utc,
+            ),
+        )
+
+        with TemporaryDirectory() as output_dir:
+            first_path, first_appended = _append_prediction_record(
+                first_record,
+                output_dir=output_dir,
+            )
+            duplicate_path, duplicate_appended = _append_prediction_record(
+                first_record,
+                output_dir=output_dir,
+            )
+            _, relocated_appended = _append_prediction_record(
+                relocated_record,
+                output_dir=output_dir,
+            )
+            _, changed_appended = _append_prediction_record(
+                changed_record,
+                output_dir=output_dir,
+            )
+            second_path, second_appended = _append_prediction_record(
+                second_record,
+                output_dir=output_dir,
+            )
+
+            with first_path.open("r", encoding="utf-8") as input_file:
+                saved_records = [
+                    json.loads(line)
+                    for line in input_file
+                    if line.strip()
+                ]
+
+        self.assertTrue(first_appended)
+        self.assertFalse(duplicate_appended)
+        self.assertFalse(relocated_appended)
+        self.assertTrue(changed_appended)
+        self.assertTrue(second_appended)
+        self.assertEqual(first_path, duplicate_path)
+        self.assertEqual(first_path, second_path)
+        self.assertEqual(len(saved_records), 3)
+        self.assertEqual(
+            first_record["prediction_id"],
+            relocated_record["prediction_id"],
+        )
+        self.assertNotEqual(
+            first_record["prediction_id"],
+            changed_record["prediction_id"],
+        )
+        self.assertNotEqual(
+            first_record["prediction_id"],
+            second_record["prediction_id"],
+        )
+        self.assertEqual(
+            saved_records[0]["forecast"]["initialization_time_unix"],
+            timestamp("2026-07-29T12:00:00+00:00"),
+        )
+        self.assertEqual(
+            saved_records[0]["emos_artifact"]["group"]["fit_sha256"],
+            "a" * 64,
+        )
+        self.assertEqual(
+            saved_records[0]["emos_artifact"]["correction_parameters"]["a"],
+            1.0,
+        )
+        self.assertEqual(saved_records[0]["algorithm_version"], 1)
+        self.assertEqual(
+            saved_records[0]["forecast_artifact_as_of_utc"],
+            "2026-07-30T11:00:00.000000Z",
+        )
+        self.assertEqual(
+            saved_records[0]["market"]["fetched_at_utc"],
+            "2026-07-30T11:30:00.000000Z",
+        )
+        self.assertEqual(
+            [interval["label"] for interval in saved_records[0]["intervals"]],
+            [
+                "T < 38°C",
+                "38°C <= T < 39°C",
+                "39°C <= T",
+            ],
+        )
+
+    def test_configured_batch_reuses_boundaries_skips_404_and_deduplicates(self):
+        cities = [
+            {
+                "name": CITY,
+                "timezone": ZONE.key,
+                "slug_prefix": "highest-temperature-in-chongqing",
+                "models": [
+                    {"name": "model-a"},
+                    {"name": "model-b"},
+                ],
+            }
+        ]
+        first_boundaries = (38.0, 39.0)
+        third_boundaries = (36.0, 37.0, 38.0)
+        missing_market = PolymarketAPIError(
+            "event not found",
+            status_code=404,
+        )
+
+        def predict(city_name, model_name, boundaries, **options):
+            return (
+                make_persistable_prediction(
+                    options["start_date"],
+                    tuple(boundaries),
+                    model_name=model_name,
+                ),
+            )
+
+        with TemporaryDirectory() as output_dir:
+            with (
+                patch(
+                    "predict_emos_max_temperature."
+                    "get_daily_max_temperature_boundaries",
+                    side_effect=[
+                        first_boundaries,
+                        missing_market,
+                        third_boundaries,
+                        first_boundaries,
+                        missing_market,
+                        third_boundaries,
+                    ],
+                ) as get_boundaries,
+                patch(
+                    "predict_emos_max_temperature."
+                    "predict_daily_max_temperature_intervals",
+                    side_effect=predict,
+                ) as predict_intervals,
+                self.assertLogs(
+                    "predict_emos_max_temperature",
+                    level="WARNING",
+                ) as warning_logs,
+            ):
+                first_writes = (
+                    predict_all_configured_daily_max_temperature_intervals(
+                        cities=cities,
+                        predict_days=3,
+                        as_of=datetime(
+                            2026,
+                            7,
+                            30,
+                            16,
+                            tzinfo=timezone.utc,
+                        ),
+                        output_dir=output_dir,
+                    )
+                )
+                duplicate_writes = (
+                    predict_all_configured_daily_max_temperature_intervals(
+                        cities=cities,
+                        predict_days=3,
+                        as_of=datetime(
+                            2026,
+                            7,
+                            30,
+                            16,
+                            tzinfo=timezone.utc,
+                        ),
+                        output_dir=output_dir,
+                    )
+                )
+
+            saved_by_model = {}
+            for model_name in ("model-a", "model-b"):
+                path = (
+                    Path(output_dir)
+                    / CITY
+                    / model_name
+                    / "predictions.jsonl"
+                )
+                with path.open("r", encoding="utf-8") as input_file:
+                    saved_by_model[model_name] = [
+                        json.loads(line)
+                        for line in input_file
+                        if line.strip()
+                    ]
+
+        self.assertEqual(get_boundaries.call_count, 6)
+        self.assertEqual(
+            [
+                boundary_call.args[1]
+                for boundary_call in get_boundaries.call_args_list[:3]
+            ],
+            [
+                date(2026, 7, 31),
+                date(2026, 8, 1),
+                date(2026, 8, 2),
+            ],
+        )
+        self.assertEqual(predict_intervals.call_count, 8)
+        self.assertTrue(
+            all(
+                prediction_call.kwargs["days"] == 1
+                and prediction_call.kwargs["include_provenance"] is True
+                for prediction_call in predict_intervals.call_args_list
+            )
+        )
+        self.assertEqual(len(first_writes), 4)
+        self.assertTrue(all(write.appended for write in first_writes))
+        self.assertEqual(len(duplicate_writes), 4)
+        self.assertTrue(
+            all(not write.appended for write in duplicate_writes)
+        )
+        self.assertIn(
+            "No Polymarket market for Chongqing-ZUCK on 2026-08-01",
+            "\n".join(warning_logs.output),
+        )
+        for records in saved_by_model.values():
+            self.assertEqual(len(records), 2)
+            self.assertEqual(
+                [
+                    record["target_date_local"]
+                    for record in records
+                ],
+                ["2026-07-31", "2026-08-02"],
+            )
+            self.assertEqual(
+                records[0]["market"]["boundaries"],
+                [38.0, 39.0],
+            )
+            self.assertEqual(
+                records[1]["market"]["boundaries"],
+                [36.0, 37.0, 38.0],
+            )
+
+    def test_configured_batch_does_not_hide_prediction_data_errors(self):
+        cities = [
+            {
+                "name": CITY,
+                "timezone": ZONE.key,
+                "slug_prefix": "highest-temperature-in-chongqing",
+                "models": [{"name": MODEL}],
+            }
+        ]
+        with (
+            patch(
+                "predict_emos_max_temperature."
+                "get_daily_max_temperature_boundaries",
+                return_value=(38.0, 39.0),
+            ),
+            patch(
+                "predict_emos_max_temperature."
+                "predict_daily_max_temperature_intervals",
+                side_effect=ValueError("corrupt EMOS artifact"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "corrupt EMOS artifact",
+            ):
+                predict_all_configured_daily_max_temperature_intervals(
+                    cities=cities,
+                    predict_days=1,
+                    as_of=datetime(
+                        2026,
+                        7,
+                        30,
+                        16,
+                        tzinfo=timezone.utc,
+                    ),
+                    output_dir="/unused",
+                )
 
 
 class DailyMaxTemperatureRealDataTest(unittest.TestCase):

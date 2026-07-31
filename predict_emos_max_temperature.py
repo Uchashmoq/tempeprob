@@ -8,12 +8,24 @@ can pass a one-row ``ensembleData`` object to ``ensembleMOS::cdf``.
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+import fcntl
+import hashlib
 import json
+import logging
 from math import isfinite
+import os
 from pathlib import Path
-from typing import Any, Sequence
+import tempfile
+from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from polymarket import (
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    PolymarketAPIError,
+    PolymarketDataError,
+    build_daily_max_temperature_event_slug,
+    get_daily_max_temperature_boundaries,
+)
 from train_emos_max_temperature import (
     DATA_DIR,
     HIGHEST_TEMPERATURE_EMOS_DIR,
@@ -29,13 +41,24 @@ from train_emos_max_temperature import (
 )
 
 __all__ = [
+    "DAILY_MAX_TEMPERATURE_EMOS_PREDICTION_DIR",
+    "DailyMaxTemperaturePredictionWrite",
     "DailyMaxTemperatureIntervalPrediction",
     "TemperatureIntervalProbability",
+    "predict_all_configured_daily_max_temperature_intervals",
     "predict_daily_max_temperature_intervals",
     "probability_daily_max_temperature_below",
 ]
 
 _CELSIUS_TO_KELVIN = 273.15
+DAILY_MAX_TEMPERATURE_EMOS_PREDICTION_DIR = Path(
+    "prediction/highest_temperature_emos"
+)
+PREDICTION_SCHEMA_VERSION = 1
+PREDICTION_ALGORITHM_VERSION = 1
+PREDICTION_RECORD_TYPE = "daily_max_temperature_emos_intervals"
+
+logger = logging.getLogger(__name__)
 
 
 class _PredictionUnavailableError(ValueError):
@@ -84,10 +107,23 @@ class DailyMaxTemperatureIntervalPrediction:
     target_date: date
     intervals: tuple[TemperatureIntervalProbability, ...]
     unavailable_reason: str | None = None
+    provenance: dict[str, Any] | None = None
 
     @property
     def available(self) -> bool:
         return self.unavailable_reason is None
+
+
+@dataclass(frozen=True)
+class DailyMaxTemperaturePredictionWrite:
+    """Result of attempting to append one prediction revision."""
+
+    city_name: str
+    model_name: str
+    target_date: date
+    prediction_id: str
+    path: Path
+    appended: bool
 
 
 @dataclass(frozen=True)
@@ -107,6 +143,20 @@ class _DailyMaxPredictionCase:
     initialization_time: int
     availability_time: int
     member_maxima: tuple[float, ...]
+    forecast_metadata: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _DailyMaxProbabilityEvaluation:
+    """CDF values together with the exact forecast and fit that produced them."""
+
+    cdf_values: tuple[float, ...]
+    artifact: DailyMaxTemperatureEmosArtifact
+    case: _DailyMaxPredictionCase
+    city_timezone: ZoneInfo
+    forecast_input_unit: str
+    expected_interval_seconds: int
+    minimum_notice_hours: float
 
 
 def _parse_target_date(value: date | str) -> date:
@@ -626,6 +676,7 @@ def _select_daily_max_forecast(
                 initialization_time=run.initialization_time,
                 availability_time=run.availability_time,
                 member_maxima=member_maxima,
+                forecast_metadata=dict(run.data["meta"]),
             )
         )
 
@@ -735,7 +786,7 @@ def _call_ensemble_mos_cdf(
     )[0]
 
 
-def _probabilities_daily_max_temperature_below_thresholds(
+def _evaluate_daily_max_temperature_below_thresholds(
     city_name: str,
     model_name: str,
     target_date: date | str,
@@ -751,8 +802,8 @@ def _probabilities_daily_max_temperature_below_thresholds(
     expected_interval_seconds: int | None = None,
     minimum_notice_hours: float | None = None,
     verify_checksums: bool = True,
-) -> tuple[float, ...]:
-    """Return the CDF values for one local day and several thresholds.
+) -> _DailyMaxProbabilityEvaluation:
+    """Evaluate CDF values and retain the exact operational inputs used.
 
     ``target_date`` is a calendar date in the city's configured timezone.
     Forecast snapshots come from
@@ -874,7 +925,7 @@ def _probabilities_daily_max_temperature_below_thresholds(
             exchangeable=exchangeable,
         )
         if len(thresholds_kelvin) == 1:
-            return (
+            cdf_values = (
                 _call_ensemble_mos_cdf(
                     case.group.fit,
                     ensemble_data,
@@ -882,11 +933,21 @@ def _probabilities_daily_max_temperature_below_thresholds(
                     parsed_target_date,
                 ),
             )
-        return _call_ensemble_mos_cdf_values(
-            case.group.fit,
-            ensemble_data,
-            thresholds_kelvin,
-            parsed_target_date,
+        else:
+            cdf_values = _call_ensemble_mos_cdf_values(
+                case.group.fit,
+                ensemble_data,
+                thresholds_kelvin,
+                parsed_target_date,
+            )
+        return _DailyMaxProbabilityEvaluation(
+            cdf_values=cdf_values,
+            artifact=artifact,
+            case=case,
+            city_timezone=resolved_timezone,
+            forecast_input_unit=resolved_forecast_unit,
+            expected_interval_seconds=resolved_interval,
+            minimum_notice_hours=resolved_notice,
         )
 
     if last_no_forecast_error is not None:
@@ -895,6 +956,43 @@ def _probabilities_daily_max_temperature_below_thresholds(
             f"for local date {parsed_target_date}"
         ) from last_no_forecast_error
     raise RuntimeError("no EMOS artifact version was evaluated")
+
+
+def _probabilities_daily_max_temperature_below_thresholds(
+    city_name: str,
+    model_name: str,
+    target_date: date | str,
+    thresholds: tuple[float, ...],
+    *,
+    threshold_unit: str = "celsius",
+    city_timezone: ZoneInfo | str | None = None,
+    forecast_input_unit: str | None = None,
+    as_of: datetime | None = None,
+    data_dir: str | Path = DATA_DIR,
+    artifact_dir: str | Path = HIGHEST_TEMPERATURE_EMOS_DIR,
+    artifact_version: str | None = "auto",
+    expected_interval_seconds: int | None = None,
+    minimum_notice_hours: float | None = None,
+    verify_checksums: bool = True,
+) -> tuple[float, ...]:
+    """Return only the CDF values from a traced daily-max evaluation."""
+    evaluation = _evaluate_daily_max_temperature_below_thresholds(
+        city_name,
+        model_name,
+        target_date,
+        thresholds,
+        threshold_unit=threshold_unit,
+        city_timezone=city_timezone,
+        forecast_input_unit=forecast_input_unit,
+        as_of=as_of,
+        data_dir=data_dir,
+        artifact_dir=artifact_dir,
+        artifact_version=artifact_version,
+        expected_interval_seconds=expected_interval_seconds,
+        minimum_notice_hours=minimum_notice_hours,
+        verify_checksums=verify_checksums,
+    )
+    return evaluation.cdf_values
 
 
 def probability_daily_max_temperature_below(
@@ -1001,6 +1099,202 @@ def _interval_probabilities_from_cdf(
     return tuple(intervals)
 
 
+def _format_utc_datetime(value: datetime) -> str:
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _format_unix_time_utc(value: int) -> str:
+    return _format_utc_datetime(
+        datetime.fromtimestamp(value, timezone.utc)
+    )
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _artifact_manifest_group(
+    artifact: DailyMaxTemperatureEmosArtifact,
+    key: DailyMaxGroupKey,
+) -> dict[str, Any]:
+    raw_groups = artifact.metadata.get("groups")
+    if not isinstance(raw_groups, list):
+        raise ValueError("EMOS artifact manifest contains no fitted groups")
+    matches = [
+        entry
+        for entry in raw_groups
+        if isinstance(entry, dict)
+        and str(entry.get("initialization_hour_utc")) == key[0]
+        and entry.get("day_ahead") == key[1]
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"cannot identify EMOS manifest metadata for group {key!r}"
+        )
+    return matches[0]
+
+
+def _emos_parameters_for_date(
+    fit: Any,
+    target_date: date,
+    member_names: tuple[str, ...],
+) -> dict[str, Any]:
+    """Extract the exact Gaussian EMOS parameter column used for a date."""
+    target_r_date = target_date.strftime("%Y%m%d")
+    matrices: dict[str, Any] = {}
+    parameter_dates: tuple[str, ...] | None = None
+    for parameter_name in ("a", "B", "c", "d"):
+        try:
+            matrix = fit.rx2(parameter_name)
+        except (AttributeError, LookupError, TypeError) as error:
+            raise ValueError(
+                f"EMOS fit has no {parameter_name!r} parameter matrix"
+            ) from error
+        raw_dimensions = getattr(matrix, "dim", None)
+        raw_column_names = getattr(matrix, "colnames", None)
+        if raw_dimensions is None or raw_column_names is None:
+            raise ValueError(
+                f"EMOS {parameter_name!r} parameter has no matrix metadata"
+            )
+        dimensions = tuple(int(value) for value in raw_dimensions)
+        column_names = tuple(str(value) for value in raw_column_names)
+        if len(dimensions) != 2 or dimensions[1] != len(column_names):
+            raise ValueError(
+                f"EMOS {parameter_name!r} parameter matrix is invalid"
+            )
+        if parameter_dates is None:
+            parameter_dates = column_names
+        elif column_names != parameter_dates:
+            raise ValueError("EMOS parameter matrices use different dates")
+        matrices[parameter_name] = matrix
+
+    if parameter_dates is None or target_r_date not in parameter_dates:
+        raise ValueError(
+            f"EMOS fit has no parameter column for {target_r_date}"
+        )
+    column_index = parameter_dates.index(target_r_date)
+
+    def column_values(
+        parameter_name: str,
+        expected_rows: int,
+    ) -> tuple[float, ...]:
+        matrix = matrices[parameter_name]
+        rows = int(matrix.dim[0])
+        if rows != expected_rows:
+            raise ValueError(
+                f"EMOS {parameter_name!r} parameter row count is invalid"
+            )
+        flat_values = tuple(float(value) for value in matrix)
+        start = column_index * rows
+        values = flat_values[start : start + rows]
+        if len(values) != rows or not all(isfinite(value) for value in values):
+            raise ValueError(
+                f"EMOS {parameter_name!r} parameters are not finite"
+            )
+        return values
+
+    b_matrix = matrices["B"]
+    raw_b_row_names = getattr(b_matrix, "rownames", None)
+    if raw_b_row_names is None:
+        raise ValueError("EMOS 'B' parameter matrix has no member names")
+    b_member_names = tuple(str(value) for value in raw_b_row_names)
+    if b_member_names != member_names:
+        raise ValueError("EMOS 'B' parameters do not match forecast members")
+    b_values = column_values("B", len(member_names))
+    return {
+        "model": "normal",
+        "parameter_date": target_r_date,
+        "a": column_values("a", 1)[0],
+        "B_by_member": dict(zip(member_names, b_values, strict=True)),
+        "c": column_values("c", 1)[0],
+        "d": column_values("d", 1)[0],
+    }
+
+
+def _prediction_provenance(
+    evaluation: _DailyMaxProbabilityEvaluation,
+    target_date: date,
+) -> dict[str, Any]:
+    case = evaluation.case
+    group_entry = _artifact_manifest_group(
+        evaluation.artifact,
+        case.group.key,
+    )
+    forecast_inputs = {
+        "member_names": list(case.group.member_names),
+        "daily_member_maxima": list(case.member_maxima),
+        "input_unit": evaluation.forecast_input_unit,
+    }
+    forecast_metadata = (
+        {}
+        if case.forecast_metadata is None
+        else dict(case.forecast_metadata)
+    )
+    correction_parameters = _emos_parameters_for_date(
+        case.group.fit,
+        target_date,
+        case.group.member_names,
+    )
+    return {
+        "city_timezone": evaluation.city_timezone.key,
+        "forecast": {
+            "initialization_time_unix": case.initialization_time,
+            "initialization_time_utc": _format_unix_time_utc(
+                case.initialization_time
+            ),
+            "availability_time_unix": case.availability_time,
+            "availability_time_utc": _format_unix_time_utc(
+                case.availability_time
+            ),
+            "initialization_hour_utc": case.group.key[0],
+            "day_ahead": case.group.key[1],
+            "meta": forecast_metadata,
+            **forecast_inputs,
+            "predictor_sha256": _canonical_json_sha256(
+                forecast_inputs
+            ),
+        },
+        "emos_artifact": {
+            "version": evaluation.artifact.version,
+            "path": str(evaluation.artifact.path),
+            "training_completed_at_utc": evaluation.artifact.metadata.get(
+                "training_completed_at_utc"
+            ),
+            "saved_at_utc": evaluation.artifact.metadata.get("saved_at_utc"),
+            "parameter_date": target_date.strftime("%Y%m%d"),
+            "correction_parameters": correction_parameters,
+            "group": {
+                "initialization_hour_utc": case.group.key[0],
+                "day_ahead": case.group.key[1],
+                "forecast_hour": group_entry.get("forecast_hour"),
+                "fit_file": group_entry.get("fit_file"),
+                "fit_sha256": group_entry.get("fit_sha256"),
+                "resolved_training_days": group_entry.get(
+                    "resolved_training_days"
+                ),
+                "sample_count": group_entry.get("sample_count"),
+            },
+        },
+        "options": {
+            "expected_interval_seconds": (
+                evaluation.expected_interval_seconds
+            ),
+            "minimum_notice_hours": evaluation.minimum_notice_hours,
+        },
+    }
+
+
 def predict_daily_max_temperature_intervals(
     city_name: str,
     model_name: str,
@@ -1019,6 +1313,7 @@ def predict_daily_max_temperature_intervals(
     minimum_notice_hours: float | None = None,
     verify_checksums: bool = True,
     allow_partial: bool = False,
+    include_provenance: bool = False,
 ) -> tuple[DailyMaxTemperatureIntervalPrediction, ...]:
     """Predict local daily-maximum probabilities for consecutive dates.
 
@@ -1035,12 +1330,15 @@ def predict_daily_max_temperature_intervals(
     ``allow_partial=True``, the returned tuple still contains that date, with
     empty ``intervals`` and a non-empty ``unavailable_reason``.  Corrupt
     artifacts, invalid data and R calculation errors are never converted into
-    partial results.
+    partial results. Set ``include_provenance=True`` to attach the selected
+    forecast run, artifact/group, and exact ``a/B/c/d`` parameter column.
     """
     if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
         raise ValueError("days must be a positive integer")
     if not isinstance(allow_partial, bool):
         raise ValueError("allow_partial must be a boolean")
+    if not isinstance(include_provenance, bool):
+        raise ValueError("include_provenance must be a boolean")
 
     normalized_unit = _normalize_temperature_unit(
         threshold_unit,
@@ -1065,22 +1363,54 @@ def predict_daily_max_temperature_intervals(
     for offset in range(days):
         target_date = first_date + timedelta(days=offset)
         try:
-            cdf_values = _probabilities_daily_max_temperature_below_thresholds(
-                city_name,
-                model_name,
-                target_date,
-                normalized_boundaries,
-                threshold_unit=normalized_unit,
-                city_timezone=city_timezone,
-                forecast_input_unit=forecast_input_unit,
-                as_of=parsed_as_of,
-                data_dir=data_dir,
-                artifact_dir=artifact_dir,
-                artifact_version=artifact_version,
-                expected_interval_seconds=expected_interval_seconds,
-                minimum_notice_hours=minimum_notice_hours,
-                verify_checksums=verify_checksums,
-            )
+            if include_provenance:
+                evaluation = (
+                    _evaluate_daily_max_temperature_below_thresholds(
+                        city_name,
+                        model_name,
+                        target_date,
+                        normalized_boundaries,
+                        threshold_unit=normalized_unit,
+                        city_timezone=city_timezone,
+                        forecast_input_unit=forecast_input_unit,
+                        as_of=parsed_as_of,
+                        data_dir=data_dir,
+                        artifact_dir=artifact_dir,
+                        artifact_version=artifact_version,
+                        expected_interval_seconds=(
+                            expected_interval_seconds
+                        ),
+                        minimum_notice_hours=minimum_notice_hours,
+                        verify_checksums=verify_checksums,
+                    )
+                )
+                cdf_values = evaluation.cdf_values
+                provenance = _prediction_provenance(
+                    evaluation,
+                    target_date,
+                )
+            else:
+                cdf_values = (
+                    _probabilities_daily_max_temperature_below_thresholds(
+                        city_name,
+                        model_name,
+                        target_date,
+                        normalized_boundaries,
+                        threshold_unit=normalized_unit,
+                        city_timezone=city_timezone,
+                        forecast_input_unit=forecast_input_unit,
+                        as_of=parsed_as_of,
+                        data_dir=data_dir,
+                        artifact_dir=artifact_dir,
+                        artifact_version=artifact_version,
+                        expected_interval_seconds=(
+                            expected_interval_seconds
+                        ),
+                        minimum_notice_hours=minimum_notice_hours,
+                        verify_checksums=verify_checksums,
+                    )
+                )
+                provenance = None
         except _PredictionUnavailableError as error:
             if not allow_partial:
                 raise _PredictionUnavailableError(
@@ -1103,6 +1433,498 @@ def predict_daily_max_temperature_intervals(
                     cdf_values,
                     normalized_unit,
                 ),
+                provenance=provenance,
             )
         )
     return tuple(predictions)
+
+
+def _validate_prediction_path_component(
+    value: Any,
+    field_name: str,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or Path(value).name != value
+        or "/" in value
+        or "\\" in value
+        or "\x00" in value
+    ):
+        raise ValueError(f"{field_name} must be a safe path component")
+    return value
+
+
+def _build_prediction_record(
+    city_name: str,
+    model_name: str,
+    slug_prefix: str,
+    event_slug: str,
+    boundaries: tuple[float, ...],
+    prediction: DailyMaxTemperatureIntervalPrediction,
+    *,
+    generated_at: datetime,
+    as_of: datetime,
+    market_fetched_at: datetime,
+) -> dict[str, Any]:
+    if not prediction.available or not prediction.intervals:
+        raise ValueError("only available interval predictions can be saved")
+    if not isinstance(prediction.provenance, dict):
+        raise ValueError("prediction provenance is required for persistence")
+
+    provenance = prediction.provenance
+    city_timezone = provenance.get("city_timezone")
+    forecast = provenance.get("forecast")
+    emos_artifact = provenance.get("emos_artifact")
+    options = provenance.get("options")
+    if (
+        not isinstance(city_timezone, str)
+        or not isinstance(forecast, dict)
+        or not isinstance(emos_artifact, dict)
+        or not isinstance(options, dict)
+    ):
+        raise ValueError("prediction provenance is incomplete")
+
+    market = {
+        "slug_prefix": slug_prefix,
+        "event_slug": event_slug,
+        "boundaries": list(boundaries),
+        "unit": "celsius",
+        "fetched_at_utc": _format_utc_datetime(market_fetched_at),
+    }
+    intervals = [
+        {
+            "lower_bound": interval.lower_bound,
+            "upper_bound": interval.upper_bound,
+            "label": interval.label,
+            "probability": interval.probability,
+            "unit": interval.unit,
+        }
+        for interval in prediction.intervals
+    ]
+    record_inputs = {
+        "schema_version": PREDICTION_SCHEMA_VERSION,
+        "algorithm_version": PREDICTION_ALGORITHM_VERSION,
+        "record_type": PREDICTION_RECORD_TYPE,
+        "city_name": city_name,
+        "model_name": model_name,
+        "city_timezone": city_timezone,
+        "target_date_local": prediction.target_date.isoformat(),
+        "market": market,
+        "forecast": forecast,
+        "emos_artifact": emos_artifact,
+        "options": options,
+    }
+    # Storage locations do not change a forecast. Exclude the artifact path
+    # from the stable identity so relative and absolute paths deduplicate.
+    artifact_identity = {
+        key: value
+        for key, value in emos_artifact.items()
+        if key != "path"
+    }
+    market_identity = {
+        key: value
+        for key, value in market.items()
+        if key != "fetched_at_utc"
+    }
+    prediction_id = _canonical_json_sha256(
+        {
+            **record_inputs,
+            "market": market_identity,
+            "emos_artifact": artifact_identity,
+            "intervals": intervals,
+        }
+    )
+    record = {
+        **record_inputs,
+        "prediction_id": prediction_id,
+        "prediction_generated_at_utc": _format_utc_datetime(generated_at),
+        "forecast_artifact_as_of_utc": _format_utc_datetime(as_of),
+        "intervals": intervals,
+    }
+    # Fail before touching storage if a nested value is not valid JSON.
+    json.dumps(record, allow_nan=False)
+    return record
+
+
+def _prediction_record_path(
+    output_dir: str | Path,
+    city_name: str,
+    model_name: str,
+) -> Path:
+    safe_city_name = _validate_prediction_path_component(
+        city_name,
+        "city_name",
+    )
+    safe_model_name = _validate_prediction_path_component(
+        model_name,
+        "model_name",
+    )
+    return (
+        Path(output_dir)
+        / safe_city_name
+        / safe_model_name
+        / "predictions.jsonl"
+    )
+
+
+def _read_prediction_records(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    try:
+        with path.open("r", encoding="utf-8") as input_file:
+            for line_number, line in enumerate(input_file, start=1):
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        f"prediction JSONL line {line_number} is not an object"
+                    )
+                prediction_id = value.get("prediction_id")
+                if not isinstance(prediction_id, str) or not prediction_id:
+                    raise ValueError(
+                        f"prediction JSONL line {line_number} has no "
+                        "prediction_id"
+                    )
+                if prediction_id in seen_ids:
+                    raise ValueError(
+                        f"duplicate prediction_id in {path}: {prediction_id}"
+                    )
+                seen_ids.add(prediction_id)
+                records.append(value)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid prediction JSONL file: {path}") from error
+    return records
+
+
+def _append_prediction_record(
+    record: Mapping[str, Any],
+    *,
+    output_dir: str | Path,
+) -> tuple[Path, bool]:
+    """Atomically append one unique record, returning ``(path, appended)``."""
+    if not isinstance(record, Mapping):
+        raise TypeError("record must be a mapping")
+    city_name = record.get("city_name")
+    model_name = record.get("model_name")
+    prediction_id = record.get("prediction_id")
+    if not isinstance(prediction_id, str) or not prediction_id:
+        raise ValueError("record must contain a prediction_id")
+    path = _prediction_record_path(
+        output_dir,
+        city_name,
+        model_name,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        existing_records = _read_prediction_records(path)
+        if any(
+            existing.get("prediction_id") == prediction_id
+            for existing in existing_records
+        ):
+            return path, False
+
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".predictions-",
+            suffix=".tmp",
+            dir=path.parent,
+            text=True,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(
+                file_descriptor,
+                "w",
+                encoding="utf-8",
+            ) as output_file:
+                for existing in existing_records:
+                    json.dump(
+                        existing,
+                        output_file,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    output_file.write("\n")
+                json.dump(
+                    dict(record),
+                    output_file,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                output_file.write("\n")
+                output_file.flush()
+                os.fsync(output_file.fileno())
+            os.replace(temporary_path, path)
+            directory_flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                directory_flags |= os.O_DIRECTORY
+            directory_descriptor = os.open(path.parent, directory_flags)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+    return path, True
+
+
+def _configured_prediction_cities(
+    raw_cities: Any,
+) -> tuple[tuple[str, ZoneInfo, str, tuple[str, ...]], ...]:
+    if not isinstance(raw_cities, (list, tuple)) or not raw_cities:
+        raise ValueError("cities must contain at least one city configuration")
+
+    prepared: list[tuple[str, ZoneInfo, str, tuple[str, ...]]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for city_index, city in enumerate(raw_cities):
+        if not isinstance(city, dict):
+            raise ValueError(
+                f"city configuration {city_index} must be a dictionary"
+            )
+        try:
+            city_name = _validate_prediction_path_component(
+                city["name"],
+                "city name",
+            )
+            timezone_name = city["timezone"]
+            slug_prefix = city["slug_prefix"]
+            raw_models = city["models"]
+        except KeyError as error:
+            raise ValueError(
+                f"city configuration {city_index} is missing "
+                f"{error.args[0]!r}"
+            ) from error
+        if not isinstance(timezone_name, str) or not timezone_name:
+            raise ValueError(f"city {city_name!r} has an invalid timezone")
+        try:
+            city_timezone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError as error:
+            raise ValueError(
+                f"city {city_name!r} has unknown timezone "
+                f"{timezone_name!r}"
+            ) from error
+        # Build one sample slug to validate the configured prefix before any
+        # network request or prediction output is attempted.
+        build_daily_max_temperature_event_slug(
+            slug_prefix,
+            date(2000, 1, 1),
+        )
+        if not isinstance(raw_models, (list, tuple)) or not raw_models:
+            raise ValueError(
+                f"city {city_name!r} must configure at least one model"
+            )
+
+        model_names: list[str] = []
+        for model_index, model in enumerate(raw_models):
+            if not isinstance(model, dict) or "name" not in model:
+                raise ValueError(
+                    f"model configuration {model_index} for "
+                    f"{city_name!r} must contain a name"
+                )
+            model_name = _validate_prediction_path_component(
+                model["name"],
+                "model name",
+            )
+            pair = (city_name, model_name)
+            if pair in seen_pairs:
+                raise ValueError(
+                    f"duplicate city/model configuration: "
+                    f"{city_name}/{model_name}"
+                )
+            seen_pairs.add(pair)
+            model_names.append(model_name)
+        prepared.append(
+            (
+                city_name,
+                city_timezone,
+                slug_prefix,
+                tuple(model_names),
+            )
+        )
+    return tuple(prepared)
+
+
+def predict_all_configured_daily_max_temperature_intervals(
+    *,
+    cities: Sequence[dict[str, Any]] | None = None,
+    predict_days: int | None = None,
+    as_of: datetime | None = None,
+    data_dir: str | Path = DATA_DIR,
+    artifact_dir: str | Path = HIGHEST_TEMPERATURE_EMOS_DIR,
+    output_dir: str | Path = DAILY_MAX_TEMPERATURE_EMOS_PREDICTION_DIR,
+    artifact_version: str | None = "auto",
+    timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    verify_checksums: bool = True,
+    strict: bool = False,
+) -> tuple[DailyMaxTemperaturePredictionWrite, ...]:
+    """Fetch markets, predict configured city/models, and persist revisions.
+
+    Dates begin at each city's local date at one shared ``as_of`` instant.
+    Boundaries are fetched once per city/date and reused for all models. A
+    missing Polymarket event or an operationally unavailable prediction is
+    warned about and skipped. Non-404 market/API failures and missing source
+    files are skipped by default and raised when ``strict=True``. Corrupt
+    artifacts, invalid forecast data, and R calculation errors always raise.
+
+    Records are stored at
+    ``prediction/highest_temperature_emos/<city>/<model>/predictions.jsonl``
+    by default. Repeating the same forecast, artifact, market boundaries, and
+    probabilities does not append a duplicate revision.
+    """
+    import config
+
+    configured_cities = config.CITY if cities is None else cities
+    resolved_days = config.PREDICT_DAYS if predict_days is None else predict_days
+    if (
+        isinstance(resolved_days, bool)
+        or not isinstance(resolved_days, int)
+        or resolved_days <= 0
+    ):
+        raise ValueError("predict_days must be a positive integer")
+    if not isinstance(strict, bool):
+        raise ValueError("strict must be a boolean")
+    if not isinstance(verify_checksums, bool):
+        raise ValueError("verify_checksums must be a boolean")
+
+    prepared_cities = _configured_prediction_cities(configured_cities)
+    parsed_as_of = _normalize_as_of(as_of)
+    writes: list[DailyMaxTemperaturePredictionWrite] = []
+    skipped_count = 0
+
+    for city_name, city_timezone, slug_prefix, model_names in prepared_cities:
+        first_date = parsed_as_of.astimezone(city_timezone).date()
+        for offset in range(resolved_days):
+            target_date = first_date + timedelta(days=offset)
+            event_slug = build_daily_max_temperature_event_slug(
+                slug_prefix,
+                target_date,
+            )
+            try:
+                boundaries = get_daily_max_temperature_boundaries(
+                    slug_prefix,
+                    target_date,
+                    timeout=timeout,
+                )
+                market_fetched_at = datetime.now(timezone.utc)
+            except PolymarketAPIError as error:
+                skipped_count += len(model_names)
+                if error.status_code == 404:
+                    logger.warning(
+                        "No Polymarket market for %s on %s; skipping",
+                        city_name,
+                        target_date,
+                    )
+                    continue
+                if strict:
+                    raise
+                logger.warning(
+                    "Could not fetch Polymarket market for %s on %s; "
+                    "skipping: %s",
+                    city_name,
+                    target_date,
+                    error,
+                )
+                continue
+            except PolymarketDataError as error:
+                skipped_count += len(model_names)
+                if strict:
+                    raise
+                logger.warning(
+                    "Invalid Polymarket market for %s on %s; skipping: %s",
+                    city_name,
+                    target_date,
+                    error,
+                )
+                continue
+
+            for model_name in model_names:
+                try:
+                    daily_predictions = (
+                        predict_daily_max_temperature_intervals(
+                            city_name,
+                            model_name,
+                            boundaries,
+                            start_date=target_date,
+                            days=1,
+                            threshold_unit="celsius",
+                            city_timezone=city_timezone,
+                            as_of=parsed_as_of,
+                            data_dir=data_dir,
+                            artifact_dir=artifact_dir,
+                            artifact_version=artifact_version,
+                            verify_checksums=verify_checksums,
+                            allow_partial=True,
+                            include_provenance=True,
+                        )
+                    )
+                except FileNotFoundError as error:
+                    skipped_count += 1
+                    if strict:
+                        raise
+                    logger.warning(
+                        "Could not predict daily maximum temperature for "
+                        "%s/%s on %s; skipping: %s",
+                        city_name,
+                        model_name,
+                        target_date,
+                        error,
+                    )
+                    continue
+
+                prediction = daily_predictions[0]
+                if not prediction.available:
+                    skipped_count += 1
+                    logger.warning(
+                        "Daily maximum-temperature prediction unavailable "
+                        "for %s/%s on %s; skipping: %s",
+                        city_name,
+                        model_name,
+                        target_date,
+                        prediction.unavailable_reason,
+                    )
+                    continue
+
+                record = _build_prediction_record(
+                    city_name,
+                    model_name,
+                    slug_prefix,
+                    event_slug,
+                    tuple(float(value) for value in boundaries),
+                    prediction,
+                    generated_at=datetime.now(timezone.utc),
+                    as_of=parsed_as_of,
+                    market_fetched_at=market_fetched_at,
+                )
+                path, appended = _append_prediction_record(
+                    record,
+                    output_dir=output_dir,
+                )
+                writes.append(
+                    DailyMaxTemperaturePredictionWrite(
+                        city_name=city_name,
+                        model_name=model_name,
+                        target_date=target_date,
+                        prediction_id=record["prediction_id"],
+                        path=path,
+                        appended=appended,
+                    )
+                )
+
+    appended_count = sum(write.appended for write in writes)
+    logger.info(
+        "Daily maximum-temperature prediction batch complete: "
+        "%d appended, %d duplicate(s), %d skipped",
+        appended_count,
+        len(writes) - appended_count,
+        skipped_count,
+    )
+    return tuple(writes)

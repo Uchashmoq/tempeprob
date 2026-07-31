@@ -70,6 +70,14 @@ __all__ = [
 class PolymarketAPIError(RuntimeError):
     """Polymarket could not be reached or returned a non-success response."""
 
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class PolymarketDataError(ValueError):
     """A Polymarket response cannot be mapped safely to EMOS intervals."""
@@ -148,8 +156,14 @@ def fetch_polymarket_event_by_slug(
         )
         response.raise_for_status()
     except requests.RequestException as error:
+        status_code = (
+            None
+            if error.response is None
+            else error.response.status_code
+        )
         raise PolymarketAPIError(
-            f"failed to fetch Polymarket event {event_slug!r}"
+            f"failed to fetch Polymarket event {event_slug!r}",
+            status_code=status_code,
         ) from error
 
     try:
