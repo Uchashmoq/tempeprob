@@ -11,10 +11,6 @@
   <div>
     <p class="eyebrow">DAILY MAXIMUM · EMOS</p>
     <h1>{{page_title}}</h1>
-    <p class="hero-copy">
-      对比不同集合模型经过 EMOS 修正后的日最高气温区间概率。
-      页面默认展示每个城市、模型和目标日期的最新修订。
-    </p>
   </div>
   <dl class="summary-strip">
     <div>
@@ -146,7 +142,7 @@
 
         <div class="peak-callout">
           <span>最高概率区间</span>
-          <strong>{{record.peak_interval.label}}</strong>
+          <strong>{{record.peak_interval.display_label}}</strong>
           <b>{{record.peak_interval.percent_text}}</b>
         </div>
 
@@ -154,7 +150,7 @@
           % for interval in record.intervals:
           <li class="probability-row{{' is-peak' if interval == record.peak_interval else ''}}">
             <div class="probability-label">
-              <span>{{interval.label}}</span>
+              <span>{{interval.display_label}}</span>
               <strong title="{{interval.precise_percent_text}}">
                 {{interval.percent_text}}
               </strong>

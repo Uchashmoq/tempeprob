@@ -23,7 +23,7 @@
   </div>
   <div class="detail-peak">
     <span>最高概率区间</span>
-    <strong>{{record.peak_interval.label}}</strong>
+    <strong>{{record.peak_interval.display_label}}</strong>
     <b>{{record.peak_interval.percent_text}}</b>
   </div>
 </section>
@@ -36,13 +36,13 @@
           <p class="section-kicker">PROBABILITY DISTRIBUTION</p>
           <h2>区间概率分布</h2>
         </div>
-        <span>总和 100%</span>
+     
       </header>
       <ol class="probability-list probability-list-large">
         % for interval in record.intervals:
         <li class="probability-row{{' is-peak' if interval == record.peak_interval else ''}}">
           <div class="probability-label">
-            <span>{{interval.label}}</span>
+            <span>{{interval.display_label}}</span>
             <strong title="{{interval.precise_percent_text}}">
               {{interval.percent_text}}
             </strong>
@@ -189,7 +189,7 @@
         <li class="{{'is-current' if historical.revision == record.revision else ''}}">
           <a href="{{historical.detail_url}}">
             <span>修订 {{historical.revision}}</span>
-            <strong>{{historical.peak_interval.label}}</strong>
+            <strong>{{historical.peak_interval.display_label}}</strong>
             <small>{{historical.generated_local_text}}</small>
           </a>
         </li>

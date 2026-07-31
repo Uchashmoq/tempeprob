@@ -17,10 +17,6 @@
           <small>Daily maximum probability desk</small>
         </span>
       </a>
-      <div class="header-status" title="页面在每次请求时重新读取预测文件">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span>实时读取 JSONL</span>
-      </div>
     </div>
     % if site_cities:
     <nav class="city-navigation" aria-label="城市">
@@ -45,7 +41,6 @@
 
   <footer class="site-footer">
     <div class="shell footer-inner">
-      <span>只读预测面板</span>
       <span>{{record_count}} 条有效记录 · 读取于 {{loaded_at_text}}</span>
     </div>
   </footer>

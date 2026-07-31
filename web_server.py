@@ -66,6 +66,22 @@ class IntervalView:
     probability: float
     unit: str
 
+    @staticmethod
+    def _format_value(value: float) -> str:
+        return f"{value:g}"
+
+    @property
+    def display_label(self) -> str:
+        unit_symbol = "°C" if self.unit == "celsius" else "K"
+        if self.lower_bound is None and self.upper_bound is not None:
+            highest_value = self.upper_bound - 1
+            return f"{self._format_value(highest_value)} or below"
+        if self.upper_bound is None and self.lower_bound is not None:
+            return f"{self._format_value(self.lower_bound)} or higher"
+        if self.lower_bound is not None and self.upper_bound is not None:
+            return f"{self._format_value(self.lower_bound)}{unit_symbol}"
+        return self.label
+
     @property
     def percent_text(self) -> str:
         if self.probability == 0:

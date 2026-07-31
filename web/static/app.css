@@ -104,22 +104,6 @@ select {
   text-transform: uppercase;
 }
 
-.header-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: #b9c7ce;
-  font-size: 13px;
-}
-
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #74c6a9;
-  box-shadow: 0 0 0 4px rgb(116 198 169 / 12%);
-}
-
 .city-navigation {
   border-top: 1px solid rgb(255 255 255 / 7%);
   background: #11222f;
@@ -181,14 +165,6 @@ select {
   font-size: clamp(32px, 4vw, 50px);
   line-height: 1.05;
   letter-spacing: -0.045em;
-}
-
-.hero-copy {
-  max-width: 660px;
-  margin: 16px 0 0;
-  color: var(--muted);
-  font-size: 15px;
-  line-height: 1.75;
 }
 
 .summary-strip {
@@ -933,10 +909,6 @@ a:focus-visible {
 
   .header-inner {
     min-height: 72px;
-  }
-
-  .header-status {
-    display: none;
   }
 
   .page-content {

@@ -8,6 +8,7 @@ from urllib.parse import quote
 from wsgiref.util import setup_testing_defaults
 
 from web_server import (
+    IntervalView,
     PREDICTION_RECORD_TYPE,
     create_app,
     load_prediction_catalog,
@@ -139,6 +140,24 @@ def wsgi_get(app, path: str, query: str = ""):
 
 
 class PredictionCatalogTest(unittest.TestCase):
+    def test_interval_display_labels_match_market_bucket_format(self):
+        intervals = (
+            IntervalView(None, 34.0, "T < 34°C", 0.1, "celsius"),
+            IntervalView(
+                34.0,
+                35.0,
+                "34°C <= T < 35°C",
+                0.7,
+                "celsius",
+            ),
+            IntervalView(43.0, None, "43°C <= T", 0.2, "celsius"),
+        )
+
+        self.assertEqual(
+            [interval.display_label for interval in intervals],
+            ["33 or below", "34°C", "43 or higher"],
+        )
+
     def test_latest_revision_uses_jsonl_append_order(self):
         first = make_record(prediction_id="a" * 64)
         second = make_record(
@@ -227,17 +246,14 @@ class PredictionCatalogTest(unittest.TestCase):
 
 class WebServerRouteTest(unittest.TestCase):
     def test_dashboard_detail_health_and_static_routes(self):
-        dangerous_label = "<script>alert('x')</script>"
+        dangerous_value = "<script>alert('x')</script>"
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
+            record = make_record(probabilities=(0.8, 0.2))
+            record["emos_artifact"]["version"] = dangerous_value
             write_records(
                 root,
-                [
-                    make_record(
-                        first_label=dangerous_label,
-                        probabilities=(0.8, 0.2),
-                    )
-                ],
+                [record],
             )
             app = create_app(root)
 
@@ -263,7 +279,9 @@ class WebServerRouteTest(unittest.TestCase):
         self.assertIn("最高气温概率总览", dashboard)
         self.assertIn("City · ZZZZ", dashboard)
         self.assertIn("&lt;script&gt;", dashboard)
-        self.assertNotIn(dangerous_label, dashboard)
+        self.assertNotIn(dangerous_value, dashboard)
+        self.assertIn("29 or below", dashboard)
+        self.assertIn("30 or higher", dashboard)
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertIn(
             "default-src 'self'",
@@ -274,7 +292,7 @@ class WebServerRouteTest(unittest.TestCase):
         self.assertIn("City · ZZZZ预测", city_page)
         self.assertTrue(detail_status.startswith("200"))
         self.assertIn("预报与修正来源", detail)
-        self.assertIn("artifact-v1", detail)
+        self.assertIn("&lt;script&gt;", detail)
         self.assertNotIn("train/highest_temperature_emos", detail)
 
         self.assertTrue(health_status.startswith("200"))
