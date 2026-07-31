@@ -45,15 +45,14 @@ __all__ = [
     "DailyMaxTemperaturePredictionWrite",
     "DailyMaxTemperatureIntervalPrediction",
     "TemperatureIntervalProbability",
+    "main",
     "predict_all_configured_daily_max_temperature_intervals",
     "predict_daily_max_temperature_intervals",
     "probability_daily_max_temperature_below",
 ]
 
 _CELSIUS_TO_KELVIN = 273.15
-DAILY_MAX_TEMPERATURE_EMOS_PREDICTION_DIR = Path(
-    "prediction/highest_temperature_emos"
-)
+DAILY_MAX_TEMPERATURE_EMOS_PREDICTION_DIR = Path("prediction/highest_temperature_emos")
 PREDICTION_SCHEMA_VERSION = 1
 PREDICTION_ALGORITHM_VERSION = 1
 PREDICTION_RECORD_TYPE = "daily_max_temperature_emos_intervals"
@@ -1108,9 +1107,7 @@ def _format_utc_datetime(value: datetime) -> str:
 
 
 def _format_unix_time_utc(value: int) -> str:
-    return _format_utc_datetime(
-        datetime.fromtimestamp(value, timezone.utc)
-    )
+    return _format_utc_datetime(datetime.fromtimestamp(value, timezone.utc))
 
 
 def _canonical_json_sha256(value: Any) -> str:
@@ -1139,9 +1136,7 @@ def _artifact_manifest_group(
         and entry.get("day_ahead") == key[1]
     ]
     if len(matches) != 1:
-        raise ValueError(
-            f"cannot identify EMOS manifest metadata for group {key!r}"
-        )
+        raise ValueError(f"cannot identify EMOS manifest metadata for group {key!r}")
     return matches[0]
 
 
@@ -1170,9 +1165,7 @@ def _emos_parameters_for_date(
         dimensions = tuple(int(value) for value in raw_dimensions)
         column_names = tuple(str(value) for value in raw_column_names)
         if len(dimensions) != 2 or dimensions[1] != len(column_names):
-            raise ValueError(
-                f"EMOS {parameter_name!r} parameter matrix is invalid"
-            )
+            raise ValueError(f"EMOS {parameter_name!r} parameter matrix is invalid")
         if parameter_dates is None:
             parameter_dates = column_names
         elif column_names != parameter_dates:
@@ -1180,9 +1173,7 @@ def _emos_parameters_for_date(
         matrices[parameter_name] = matrix
 
     if parameter_dates is None or target_r_date not in parameter_dates:
-        raise ValueError(
-            f"EMOS fit has no parameter column for {target_r_date}"
-        )
+        raise ValueError(f"EMOS fit has no parameter column for {target_r_date}")
     column_index = parameter_dates.index(target_r_date)
 
     def column_values(
@@ -1192,16 +1183,12 @@ def _emos_parameters_for_date(
         matrix = matrices[parameter_name]
         rows = int(matrix.dim[0])
         if rows != expected_rows:
-            raise ValueError(
-                f"EMOS {parameter_name!r} parameter row count is invalid"
-            )
+            raise ValueError(f"EMOS {parameter_name!r} parameter row count is invalid")
         flat_values = tuple(float(value) for value in matrix)
         start = column_index * rows
         values = flat_values[start : start + rows]
         if len(values) != rows or not all(isfinite(value) for value in values):
-            raise ValueError(
-                f"EMOS {parameter_name!r} parameters are not finite"
-            )
+            raise ValueError(f"EMOS {parameter_name!r} parameters are not finite")
         return values
 
     b_matrix = matrices["B"]
@@ -1237,9 +1224,7 @@ def _prediction_provenance(
         "input_unit": evaluation.forecast_input_unit,
     }
     forecast_metadata = (
-        {}
-        if case.forecast_metadata is None
-        else dict(case.forecast_metadata)
+        {} if case.forecast_metadata is None else dict(case.forecast_metadata)
     )
     correction_parameters = _emos_parameters_for_date(
         case.group.fit,
@@ -1250,20 +1235,14 @@ def _prediction_provenance(
         "city_timezone": evaluation.city_timezone.key,
         "forecast": {
             "initialization_time_unix": case.initialization_time,
-            "initialization_time_utc": _format_unix_time_utc(
-                case.initialization_time
-            ),
+            "initialization_time_utc": _format_unix_time_utc(case.initialization_time),
             "availability_time_unix": case.availability_time,
-            "availability_time_utc": _format_unix_time_utc(
-                case.availability_time
-            ),
+            "availability_time_utc": _format_unix_time_utc(case.availability_time),
             "initialization_hour_utc": case.group.key[0],
             "day_ahead": case.group.key[1],
             "meta": forecast_metadata,
             **forecast_inputs,
-            "predictor_sha256": _canonical_json_sha256(
-                forecast_inputs
-            ),
+            "predictor_sha256": _canonical_json_sha256(forecast_inputs),
         },
         "emos_artifact": {
             "version": evaluation.artifact.version,
@@ -1280,16 +1259,12 @@ def _prediction_provenance(
                 "forecast_hour": group_entry.get("forecast_hour"),
                 "fit_file": group_entry.get("fit_file"),
                 "fit_sha256": group_entry.get("fit_sha256"),
-                "resolved_training_days": group_entry.get(
-                    "resolved_training_days"
-                ),
+                "resolved_training_days": group_entry.get("resolved_training_days"),
                 "sample_count": group_entry.get("sample_count"),
             },
         },
         "options": {
-            "expected_interval_seconds": (
-                evaluation.expected_interval_seconds
-            ),
+            "expected_interval_seconds": (evaluation.expected_interval_seconds),
             "minimum_notice_hours": evaluation.minimum_notice_hours,
         },
     }
@@ -1364,25 +1339,21 @@ def predict_daily_max_temperature_intervals(
         target_date = first_date + timedelta(days=offset)
         try:
             if include_provenance:
-                evaluation = (
-                    _evaluate_daily_max_temperature_below_thresholds(
-                        city_name,
-                        model_name,
-                        target_date,
-                        normalized_boundaries,
-                        threshold_unit=normalized_unit,
-                        city_timezone=city_timezone,
-                        forecast_input_unit=forecast_input_unit,
-                        as_of=parsed_as_of,
-                        data_dir=data_dir,
-                        artifact_dir=artifact_dir,
-                        artifact_version=artifact_version,
-                        expected_interval_seconds=(
-                            expected_interval_seconds
-                        ),
-                        minimum_notice_hours=minimum_notice_hours,
-                        verify_checksums=verify_checksums,
-                    )
+                evaluation = _evaluate_daily_max_temperature_below_thresholds(
+                    city_name,
+                    model_name,
+                    target_date,
+                    normalized_boundaries,
+                    threshold_unit=normalized_unit,
+                    city_timezone=city_timezone,
+                    forecast_input_unit=forecast_input_unit,
+                    as_of=parsed_as_of,
+                    data_dir=data_dir,
+                    artifact_dir=artifact_dir,
+                    artifact_version=artifact_version,
+                    expected_interval_seconds=(expected_interval_seconds),
+                    minimum_notice_hours=minimum_notice_hours,
+                    verify_checksums=verify_checksums,
                 )
                 cdf_values = evaluation.cdf_values
                 provenance = _prediction_provenance(
@@ -1390,25 +1361,21 @@ def predict_daily_max_temperature_intervals(
                     target_date,
                 )
             else:
-                cdf_values = (
-                    _probabilities_daily_max_temperature_below_thresholds(
-                        city_name,
-                        model_name,
-                        target_date,
-                        normalized_boundaries,
-                        threshold_unit=normalized_unit,
-                        city_timezone=city_timezone,
-                        forecast_input_unit=forecast_input_unit,
-                        as_of=parsed_as_of,
-                        data_dir=data_dir,
-                        artifact_dir=artifact_dir,
-                        artifact_version=artifact_version,
-                        expected_interval_seconds=(
-                            expected_interval_seconds
-                        ),
-                        minimum_notice_hours=minimum_notice_hours,
-                        verify_checksums=verify_checksums,
-                    )
+                cdf_values = _probabilities_daily_max_temperature_below_thresholds(
+                    city_name,
+                    model_name,
+                    target_date,
+                    normalized_boundaries,
+                    threshold_unit=normalized_unit,
+                    city_timezone=city_timezone,
+                    forecast_input_unit=forecast_input_unit,
+                    as_of=parsed_as_of,
+                    data_dir=data_dir,
+                    artifact_dir=artifact_dir,
+                    artifact_version=artifact_version,
+                    expected_interval_seconds=(expected_interval_seconds),
+                    minimum_notice_hours=minimum_notice_hours,
+                    verify_checksums=verify_checksums,
                 )
                 provenance = None
         except _PredictionUnavailableError as error:
@@ -1519,14 +1486,10 @@ def _build_prediction_record(
     # Storage locations do not change a forecast. Exclude the artifact path
     # from the stable identity so relative and absolute paths deduplicate.
     artifact_identity = {
-        key: value
-        for key, value in emos_artifact.items()
-        if key != "path"
+        key: value for key, value in emos_artifact.items() if key != "path"
     }
     market_identity = {
-        key: value
-        for key, value in market.items()
-        if key != "fetched_at_utc"
+        key: value for key, value in market.items() if key != "fetched_at_utc"
     }
     prediction_id = _canonical_json_sha256(
         {
@@ -1561,19 +1524,13 @@ def _prediction_record_path(
         model_name,
         "model_name",
     )
-    return (
-        Path(output_dir)
-        / safe_city_name
-        / safe_model_name
-        / "predictions.jsonl"
-    )
+    return Path(output_dir) / safe_city_name / safe_model_name / "predictions.jsonl"
 
 
 def _read_prediction_records(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     records: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
     try:
         with path.open("r", encoding="utf-8") as input_file:
             for line_number, line in enumerate(input_file, start=1):
@@ -1587,18 +1544,30 @@ def _read_prediction_records(path: Path) -> list[dict[str, Any]]:
                 prediction_id = value.get("prediction_id")
                 if not isinstance(prediction_id, str) or not prediction_id:
                     raise ValueError(
-                        f"prediction JSONL line {line_number} has no "
-                        "prediction_id"
+                        f"prediction JSONL line {line_number} has no " "prediction_id"
                     )
-                if prediction_id in seen_ids:
-                    raise ValueError(
-                        f"duplicate prediction_id in {path}: {prediction_id}"
-                    )
-                seen_ids.add(prediction_id)
                 records.append(value)
     except json.JSONDecodeError as error:
         raise ValueError(f"invalid prediction JSONL file: {path}") from error
     return records
+
+
+def _prediction_record_series_key(
+    record: Mapping[str, Any],
+) -> tuple[str, str, str, str]:
+    """Identify revisions that predict the same variable and local date."""
+    record_type = record.get("record_type")
+    city_name = record.get("city_name")
+    model_name = record.get("model_name")
+    target_date = record.get("target_date_local")
+    if not isinstance(record_type, str) or not record_type:
+        raise ValueError("prediction record must contain a record_type")
+    city_name = _validate_prediction_path_component(city_name, "city_name")
+    model_name = _validate_prediction_path_component(model_name, "model_name")
+    if not isinstance(target_date, str):
+        raise ValueError("prediction record must contain target_date_local")
+    _parse_target_date(target_date)
+    return record_type, city_name, model_name, target_date
 
 
 def _append_prediction_record(
@@ -1606,7 +1575,7 @@ def _append_prediction_record(
     *,
     output_dir: str | Path,
 ) -> tuple[Path, bool]:
-    """Atomically append one unique record, returning ``(path, appended)``."""
+    """Append only when the latest revision for this date is different."""
     if not isinstance(record, Mapping):
         raise TypeError("record must be a mapping")
     city_name = record.get("city_name")
@@ -1614,10 +1583,11 @@ def _append_prediction_record(
     prediction_id = record.get("prediction_id")
     if not isinstance(prediction_id, str) or not prediction_id:
         raise ValueError("record must contain a prediction_id")
+    series_key = _prediction_record_series_key(record)
     path = _prediction_record_path(
         output_dir,
-        city_name,
-        model_name,
+        city_name,  # type: ignore
+        model_name,  # type: ignore
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f"{path.name}.lock")
@@ -1625,9 +1595,17 @@ def _append_prediction_record(
     with lock_path.open("a+", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         existing_records = _read_prediction_records(path)
-        if any(
-            existing.get("prediction_id") == prediction_id
-            for existing in existing_records
+        latest_record = next(
+            (
+                existing
+                for existing in reversed(existing_records)
+                if _prediction_record_series_key(existing) == series_key
+            ),
+            None,
+        )
+        if (
+            latest_record is not None
+            and latest_record.get("prediction_id") == prediction_id
         ):
             return path, False
 
@@ -1687,9 +1665,7 @@ def _configured_prediction_cities(
     seen_pairs: set[tuple[str, str]] = set()
     for city_index, city in enumerate(raw_cities):
         if not isinstance(city, dict):
-            raise ValueError(
-                f"city configuration {city_index} must be a dictionary"
-            )
+            raise ValueError(f"city configuration {city_index} must be a dictionary")
         try:
             city_name = _validate_prediction_path_component(
                 city["name"],
@@ -1700,8 +1676,7 @@ def _configured_prediction_cities(
             raw_models = city["models"]
         except KeyError as error:
             raise ValueError(
-                f"city configuration {city_index} is missing "
-                f"{error.args[0]!r}"
+                f"city configuration {city_index} is missing " f"{error.args[0]!r}"
             ) from error
         if not isinstance(timezone_name, str) or not timezone_name:
             raise ValueError(f"city {city_name!r} has an invalid timezone")
@@ -1709,8 +1684,7 @@ def _configured_prediction_cities(
             city_timezone = ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError as error:
             raise ValueError(
-                f"city {city_name!r} has unknown timezone "
-                f"{timezone_name!r}"
+                f"city {city_name!r} has unknown timezone " f"{timezone_name!r}"
             ) from error
         # Build one sample slug to validate the configured prefix before any
         # network request or prediction output is attempted.
@@ -1719,9 +1693,7 @@ def _configured_prediction_cities(
             date(2000, 1, 1),
         )
         if not isinstance(raw_models, (list, tuple)) or not raw_models:
-            raise ValueError(
-                f"city {city_name!r} must configure at least one model"
-            )
+            raise ValueError(f"city {city_name!r} must configure at least one model")
 
         model_names: list[str] = []
         for model_index, model in enumerate(raw_models):
@@ -1737,8 +1709,7 @@ def _configured_prediction_cities(
             pair = (city_name, model_name)
             if pair in seen_pairs:
                 raise ValueError(
-                    f"duplicate city/model configuration: "
-                    f"{city_name}/{model_name}"
+                    f"duplicate city/model configuration: " f"{city_name}/{model_name}"
                 )
             seen_pairs.add(pair)
             model_names.append(model_name)
@@ -1777,8 +1748,9 @@ def predict_all_configured_daily_max_temperature_intervals(
 
     Records are stored at
     ``prediction/highest_temperature_emos/<city>/<model>/predictions.jsonl``
-    by default. Repeating the same forecast, artifact, market boundaries, and
-    probabilities does not append a duplicate revision.
+    by default. For each target date, a new revision is appended only when its
+    forecast, artifact, market boundaries, or probabilities differ from that
+    date's latest saved revision.
     """
     import config
 
@@ -1827,8 +1799,7 @@ def predict_all_configured_daily_max_temperature_intervals(
                 if strict:
                     raise
                 logger.warning(
-                    "Could not fetch Polymarket market for %s on %s; "
-                    "skipping: %s",
+                    "Could not fetch Polymarket market for %s on %s; " "skipping: %s",
                     city_name,
                     target_date,
                     error,
@@ -1848,23 +1819,21 @@ def predict_all_configured_daily_max_temperature_intervals(
 
             for model_name in model_names:
                 try:
-                    daily_predictions = (
-                        predict_daily_max_temperature_intervals(
-                            city_name,
-                            model_name,
-                            boundaries,
-                            start_date=target_date,
-                            days=1,
-                            threshold_unit="celsius",
-                            city_timezone=city_timezone,
-                            as_of=parsed_as_of,
-                            data_dir=data_dir,
-                            artifact_dir=artifact_dir,
-                            artifact_version=artifact_version,
-                            verify_checksums=verify_checksums,
-                            allow_partial=True,
-                            include_provenance=True,
-                        )
+                    daily_predictions = predict_daily_max_temperature_intervals(
+                        city_name,
+                        model_name,
+                        boundaries,
+                        start_date=target_date,
+                        days=1,
+                        threshold_unit="celsius",
+                        city_timezone=city_timezone,
+                        as_of=parsed_as_of,
+                        data_dir=data_dir,
+                        artifact_dir=artifact_dir,
+                        artifact_version=artifact_version,
+                        verify_checksums=verify_checksums,
+                        allow_partial=True,
+                        include_provenance=True,
                     )
                 except FileNotFoundError as error:
                     skipped_count += 1
@@ -1922,9 +1891,18 @@ def predict_all_configured_daily_max_temperature_intervals(
     appended_count = sum(write.appended for write in writes)
     logger.info(
         "Daily maximum-temperature prediction batch complete: "
-        "%d appended, %d duplicate(s), %d skipped",
+        "%d appended, %d unchanged, %d skipped",
         appended_count,
         len(writes) - appended_count,
         skipped_count,
     )
     return tuple(writes)
+
+
+def main() -> None:
+    """Run predictions for every city/model configured in ``config.CITY``."""
+    predict_all_configured_daily_max_temperature_intervals()
+
+
+if __name__ == "__main__":
+    main()

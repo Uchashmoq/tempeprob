@@ -24,6 +24,7 @@ from predict_emos_max_temperature import (
     _select_daily_max_forecast,
     _validate_interval_boundaries,
     DailyMaxTemperatureIntervalPrediction,
+    main,
     predict_all_configured_daily_max_temperature_intervals,
     predict_daily_max_temperature_intervals,
     probability_daily_max_temperature_below,
@@ -897,6 +898,15 @@ class DailyMaxTemperatureIntervalProbabilityTest(unittest.TestCase):
 
 
 class DailyMaxTemperaturePredictionPersistenceTest(unittest.TestCase):
+    @patch(
+        "predict_emos_max_temperature."
+        "predict_all_configured_daily_max_temperature_intervals"
+    )
+    def test_main_runs_all_configured_predictions(self, predict_all):
+        main()
+
+        predict_all.assert_called_once_with()
+
     def test_prediction_record_append_is_idempotent_and_versioned(self):
         target = date(2026, 7, 31)
         boundaries = (38.0, 39.0)
@@ -1069,6 +1079,14 @@ class DailyMaxTemperaturePredictionPersistenceTest(unittest.TestCase):
                 second_record,
                 output_dir=output_dir,
             )
+            _, reverted_appended = _append_prediction_record(
+                first_record,
+                output_dir=output_dir,
+            )
+            _, reverted_duplicate_appended = _append_prediction_record(
+                first_record,
+                output_dir=output_dir,
+            )
 
             with first_path.open("r", encoding="utf-8") as input_file:
                 saved_records = [
@@ -1082,9 +1100,15 @@ class DailyMaxTemperaturePredictionPersistenceTest(unittest.TestCase):
         self.assertFalse(relocated_appended)
         self.assertTrue(changed_appended)
         self.assertTrue(second_appended)
+        self.assertTrue(reverted_appended)
+        self.assertFalse(reverted_duplicate_appended)
         self.assertEqual(first_path, duplicate_path)
         self.assertEqual(first_path, second_path)
-        self.assertEqual(len(saved_records), 3)
+        self.assertEqual(len(saved_records), 4)
+        self.assertEqual(
+            saved_records[0]["prediction_id"],
+            saved_records[-1]["prediction_id"],
+        )
         self.assertEqual(
             first_record["prediction_id"],
             relocated_record["prediction_id"],

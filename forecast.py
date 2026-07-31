@@ -1,14 +1,22 @@
 import json
 import logging
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import config
 import data_source
+import predict_emos_max_temperature
 import train_emos_max_temperature
 
 latest_forecast: dict[str, dict] = {}
+_FORECAST_POSTPROCESS_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="forecast-postprocess",
+)
 
 
 def get_latest_forecast(city_name, model_name):
@@ -121,8 +129,139 @@ def _forecast_update_training_metadata(
     return metadata
 
 
+def _train_updated_forecast(city_name: str, model_name: str) -> None:
+    try:
+        train_city_model = (
+            train_emos_max_temperature.train_daily_max_temperature_emos_for_city_model
+        )
+        artifact_path = train_city_model(
+            city_name,
+            model_name,
+            extra_metadata=_forecast_update_training_metadata(
+                city_name,
+                model_name,
+            ),
+        )
+    except Exception:
+        logging.exception(
+            "Forecast updated but failed to train daily-max EMOS for %s/%s",
+            city_name,
+            model_name,
+        )
+        return
+
+    if artifact_path is not None:
+        logging.info(
+            "Trained daily-max EMOS for %s/%s: %s",
+            city_name,
+            model_name,
+            artifact_path,
+        )
+
+
+def _predict_updated_forecast(city: dict, model: dict) -> None:
+    city_name = city["name"]
+    model_name = model["name"]
+    prediction_city = {
+        **city,
+        "models": [dict(model)],
+    }
+    try:
+        writes = (
+            predict_emos_max_temperature.predict_all_configured_daily_max_temperature_intervals(
+                cities=[prediction_city],
+                predict_days=config.PREDICT_DAYS,
+            )
+        )
+    except Exception:
+        logging.exception(
+            "Forecast updated but failed to predict daily-max temperature "
+            "for %s/%s",
+            city_name,
+            model_name,
+        )
+        return
+
+    appended_count = sum(write.appended for write in writes)
+    logging.info(
+        "Updated daily-max predictions for %s/%s: "
+        "%d appended, %d unchanged",
+        city_name,
+        model_name,
+        appended_count,
+        len(writes) - appended_count,
+    )
+
+
+def _postprocess_updated_forecast(
+    city: dict,
+    model: dict,
+    *,
+    auto_train: bool,
+    auto_predict: bool,
+) -> None:
+    """Run one updated forecast's training and prediction in strict order."""
+    if auto_train:
+        _train_updated_forecast(city["name"], model["name"])
+    if auto_predict:
+        _predict_updated_forecast(city, model)
+
+
+def _report_postprocess_failure(
+    city_name: str,
+    model_name: str,
+    future: Future,
+) -> None:
+    try:
+        future.result()
+    except Exception:
+        logging.exception(
+            "Unexpected background post-processing failure for %s/%s",
+            city_name,
+            model_name,
+        )
+
+
+def _schedule_updated_forecast_postprocessing(
+    city: dict,
+    model: dict,
+    *,
+    auto_train: bool,
+    auto_predict: bool,
+) -> Future | None:
+    """Queue train-then-predict work without blocking forecast collection."""
+    city_snapshot = deepcopy(city)
+    model_snapshot = deepcopy(model)
+    city_name = city_snapshot["name"]
+    model_name = model_snapshot["name"]
+    try:
+        future = _FORECAST_POSTPROCESS_EXECUTOR.submit(
+            _postprocess_updated_forecast,
+            city_snapshot,
+            model_snapshot,
+            auto_train=auto_train,
+            auto_predict=auto_predict,
+        )
+    except RuntimeError:
+        logging.exception(
+            "Could not schedule forecast post-processing for %s/%s",
+            city_name,
+            model_name,
+        )
+        return None
+
+    future.add_done_callback(
+        partial(
+            _report_postprocess_failure,
+            city_name,
+            model_name,
+        )
+    )
+    return future
+
+
 def _update_forecasts_once():
-    """Update every configured forecast and train each changed city/model."""
+    """Update forecasts and queue post-processing for each changed model."""
     for city in config.CITY:
         city_name = city["name"]
         for model in city["models"]:
@@ -137,35 +276,17 @@ def _update_forecasts_once():
                 )
                 continue
 
-            if updated is not True or not config.AUTO_TRAIN:
+            if updated is not True:
                 continue
 
-            try:
-                train_city_model = (
-                    train_emos_max_temperature.train_daily_max_temperature_emos_for_city_model
-                )
-                artifact_path = train_city_model(
-                    city_name,
-                    model_name,
-                    extra_metadata=_forecast_update_training_metadata(
-                        city_name,
-                        model_name,
-                    ),
-                )
-            except Exception:
-                logging.exception(
-                    "Forecast updated but failed to train daily-max EMOS for %s/%s",
-                    city_name,
-                    model_name,
-                )
-                continue
-
-            if artifact_path is not None:
-                logging.info(
-                    "Trained daily-max EMOS for %s/%s: %s",
-                    city_name,
-                    model_name,
-                    artifact_path,
+            auto_train = config.AUTO_TRAIN
+            auto_predict = config.AUTO_PREDICT
+            if auto_train or auto_predict:
+                _schedule_updated_forecast_postprocessing(
+                    city,
+                    model,
+                    auto_train=auto_train,
+                    auto_predict=auto_predict,
                 )
 
 

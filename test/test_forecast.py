@@ -1,14 +1,45 @@
-"""Tests for periodic forecast updates and triggered EMOS training."""
+"""Tests for forecast updates and triggered EMOS training and prediction."""
 
 import unittest
 from pathlib import Path
-from unittest.mock import call, patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
 import forecast
 
 
+class _InlineFuture:
+    def __init__(self, result=None, exception: Exception | None = None):
+        self._result = result
+        self._exception = exception
+
+    def result(self):
+        if self._exception is not None:
+            raise self._exception
+        return self._result
+
+    def add_done_callback(self, callback):
+        callback(self)
+
+
+class _InlineExecutor:
+    def submit(self, function, *args, **kwargs):
+        try:
+            result = function(*args, **kwargs)
+        except Exception as error:
+            return _InlineFuture(exception=error)
+        return _InlineFuture(result=result)
+
+
 class ForecastPeriodicUpdateTest(unittest.TestCase):
     def setUp(self):
+        executor_patcher = patch.object(
+            forecast,
+            "_FORECAST_POSTPROCESS_EXECUTOR",
+            _InlineExecutor(),
+        )
+        executor_patcher.start()
+        self.addCleanup(executor_patcher.stop)
         self.cities = [
             {
                 "name": "City-One",
@@ -20,6 +51,64 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
                 ],
             }
         ]
+
+    def test_postprocessing_trains_before_predicting(self):
+        events = []
+        city = self.cities[0]
+        model = city["models"][0]
+
+        with (
+            patch.object(
+                forecast,
+                "_train_updated_forecast",
+                side_effect=lambda *_: events.append("train"),
+            ),
+            patch.object(
+                forecast,
+                "_predict_updated_forecast",
+                side_effect=lambda *_: events.append("predict"),
+            ),
+        ):
+            forecast._postprocess_updated_forecast(
+                city,
+                model,
+                auto_train=True,
+                auto_predict=True,
+            )
+
+        self.assertEqual(events, ["train", "predict"])
+
+    def test_scheduler_queues_work_without_running_it_inline(self):
+        executor = Mock()
+        future = Mock()
+        executor.submit.return_value = future
+        city = self.cities[0]
+        model = city["models"][0]
+
+        with patch.object(
+            forecast,
+            "_FORECAST_POSTPROCESS_EXECUTOR",
+            executor,
+        ):
+            result = forecast._schedule_updated_forecast_postprocessing(
+                city,
+                model,
+                auto_train=True,
+                auto_predict=True,
+            )
+
+        self.assertIs(result, future)
+        executor.submit.assert_called_once()
+        submitted = executor.submit.call_args
+        self.assertIs(
+            submitted.args[0],
+            forecast._postprocess_updated_forecast,
+        )
+        self.assertIsNot(submitted.args[1], city)
+        self.assertIsNot(submitted.args[2], model)
+        self.assertEqual(submitted.kwargs["auto_train"], True)
+        self.assertEqual(submitted.kwargs["auto_predict"], True)
+        future.add_done_callback.assert_called_once()
 
     def test_trains_only_forecast_that_was_updated(self):
         latest = {
@@ -40,6 +129,7 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
         with (
             patch.object(forecast.config, "CITY", self.cities),
             patch.object(forecast.config, "AUTO_TRAIN", True),
+            patch.object(forecast.config, "AUTO_PREDICT", False),
             patch.dict(forecast.latest_forecast, latest, clear=True),
             patch.object(
                 forecast,
@@ -79,6 +169,8 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
         with (
             patch.object(forecast.config, "CITY", self.cities),
             patch.object(forecast.config, "AUTO_TRAIN", True),
+            patch.object(forecast.config, "AUTO_PREDICT", True),
+            patch.object(forecast.config, "PREDICT_DAYS", 2),
             patch.dict(forecast.latest_forecast, {}, clear=True),
             patch.object(
                 forecast,
@@ -90,6 +182,11 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
                 "train_daily_max_temperature_emos_for_city_model",
                 side_effect=[RuntimeError("R optimizer failed"), None],
             ) as trainer,
+            patch.object(
+                forecast.predict_emos_max_temperature,
+                "predict_all_configured_daily_max_temperature_intervals",
+                return_value=(),
+            ) as predictor,
             self.assertLogs(level="ERROR") as error_logs,
         ):
             forecast._update_forecasts_once()
@@ -98,6 +195,7 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
             [training_call.args[:2] for training_call in trainer.call_args_list],
             [("City-One", "model-a"), ("City-One", "model-b")],
         )
+        self.assertEqual(predictor.call_count, 2)
         self.assertIn(
             "Forecast updated but failed to train daily-max EMOS "
             "for City-One/model-a",
@@ -108,6 +206,7 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
         with (
             patch.object(forecast.config, "CITY", self.cities),
             patch.object(forecast.config, "AUTO_TRAIN", True),
+            patch.object(forecast.config, "AUTO_PREDICT", False),
             patch.dict(forecast.latest_forecast, {}, clear=True),
             patch.object(
                 forecast,
@@ -134,6 +233,7 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
         with (
             patch.object(forecast.config, "CITY", self.cities),
             patch.object(forecast.config, "AUTO_TRAIN", False),
+            patch.object(forecast.config, "AUTO_PREDICT", False),
             patch.dict(forecast.latest_forecast, {}, clear=True),
             patch.object(
                 forecast,
@@ -144,11 +244,82 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
                 forecast.train_emos_max_temperature,
                 "train_daily_max_temperature_emos_for_city_model",
             ) as trainer,
+            patch.object(
+                forecast.predict_emos_max_temperature,
+                "predict_all_configured_daily_max_temperature_intervals",
+            ) as predictor,
         ):
             forecast._update_forecasts_once()
 
         self.assertEqual(updater.call_count, 2)
         trainer.assert_not_called()
+        predictor.assert_not_called()
+
+    def test_predicts_only_forecast_that_was_updated(self):
+        with (
+            patch.object(forecast.config, "CITY", self.cities),
+            patch.object(forecast.config, "AUTO_TRAIN", False),
+            patch.object(forecast.config, "AUTO_PREDICT", True),
+            patch.object(forecast.config, "PREDICT_DAYS", 3),
+            patch.dict(forecast.latest_forecast, {}, clear=True),
+            patch.object(
+                forecast,
+                "update_forecast",
+                side_effect=[False, True],
+            ),
+            patch.object(
+                forecast.predict_emos_max_temperature,
+                "predict_all_configured_daily_max_temperature_intervals",
+                return_value=(
+                    SimpleNamespace(appended=True),
+                    SimpleNamespace(appended=False),
+                ),
+            ) as predictor,
+            self.assertLogs(level="INFO") as info_logs,
+        ):
+            forecast._update_forecasts_once()
+
+        predictor.assert_called_once_with(
+            cities=[
+                {
+                    **self.cities[0],
+                    "models": [{"name": "model-b"}],
+                }
+            ],
+            predict_days=3,
+        )
+        self.assertIn(
+            "1 appended, 1 unchanged",
+            "\n".join(info_logs.output),
+        )
+
+    def test_prediction_failure_does_not_stop_later_models(self):
+        with (
+            patch.object(forecast.config, "CITY", self.cities),
+            patch.object(forecast.config, "AUTO_TRAIN", False),
+            patch.object(forecast.config, "AUTO_PREDICT", True),
+            patch.object(forecast.config, "PREDICT_DAYS", 2),
+            patch.dict(forecast.latest_forecast, {}, clear=True),
+            patch.object(
+                forecast,
+                "update_forecast",
+                return_value=True,
+            ),
+            patch.object(
+                forecast.predict_emos_max_temperature,
+                "predict_all_configured_daily_max_temperature_intervals",
+                side_effect=[RuntimeError("prediction failed"), ()],
+            ) as predictor,
+            self.assertLogs(level="ERROR") as error_logs,
+        ):
+            forecast._update_forecasts_once()
+
+        self.assertEqual(predictor.call_count, 2)
+        self.assertIn(
+            "Forecast updated but failed to predict daily-max temperature "
+            "for City-One/model-a",
+            "\n".join(error_logs.output),
+        )
 
     def test_periodic_entry_initializes_cache_before_first_update(self):
         latest = {"meta": {"last_run_initialisation_time": 100}}
