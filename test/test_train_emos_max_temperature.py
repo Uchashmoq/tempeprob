@@ -193,6 +193,11 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
                 initialization_time="06",
                 day_ahead=2,
             ),
+            ("12", 3): make_daily_max_group(
+                insufficient_count,
+                initialization_time="12",
+                day_ahead=3,
+            ),
         }
 
         with (
@@ -216,7 +221,10 @@ class DailyMaxTemperatureGroupingTest(unittest.TestCase):
         fit.assert_called_once()
         self.assertEqual(fit.call_args.args[1], sufficient_count)
         warning_text = "\n".join(warning_logs.output)
+        self.assertEqual(len(warning_logs.output), 1)
+        self.assertIn("Skipping 2 insufficient", warning_text)
         self.assertIn("('00', 1)", warning_text)
+        self.assertIn("('12', 3)", warning_text)
         self.assertIn(
             f"only {insufficient_count} training date(s)",
             warning_text,

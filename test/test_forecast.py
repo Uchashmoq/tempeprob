@@ -39,6 +39,7 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
 
         with (
             patch.object(forecast.config, "CITY", self.cities),
+            patch.object(forecast.config, "AUTO_TRAIN", True),
             patch.dict(forecast.latest_forecast, latest, clear=True),
             patch.object(
                 forecast,
@@ -77,6 +78,7 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
     def test_training_failure_does_not_stop_later_models(self):
         with (
             patch.object(forecast.config, "CITY", self.cities),
+            patch.object(forecast.config, "AUTO_TRAIN", True),
             patch.dict(forecast.latest_forecast, {}, clear=True),
             patch.object(
                 forecast,
@@ -105,6 +107,7 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
     def test_update_failure_does_not_train_or_stop_later_models(self):
         with (
             patch.object(forecast.config, "CITY", self.cities),
+            patch.object(forecast.config, "AUTO_TRAIN", True),
             patch.dict(forecast.latest_forecast, {}, clear=True),
             patch.object(
                 forecast,
@@ -126,6 +129,26 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
             "Failed to update forecast for City-One/model-a",
             "\n".join(error_logs.output),
         )
+
+    def test_does_not_train_when_auto_train_is_disabled(self):
+        with (
+            patch.object(forecast.config, "CITY", self.cities),
+            patch.object(forecast.config, "AUTO_TRAIN", False),
+            patch.dict(forecast.latest_forecast, {}, clear=True),
+            patch.object(
+                forecast,
+                "update_forecast",
+                return_value=True,
+            ) as updater,
+            patch.object(
+                forecast.train_emos_max_temperature,
+                "train_daily_max_temperature_emos_for_city_model",
+            ) as trainer,
+        ):
+            forecast._update_forecasts_once()
+
+        self.assertEqual(updater.call_count, 2)
+        trainer.assert_not_called()
 
     def test_periodic_entry_initializes_cache_before_first_update(self):
         latest = {"meta": {"last_run_initialisation_time": 100}}

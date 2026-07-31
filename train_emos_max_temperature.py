@@ -857,13 +857,26 @@ def train_daily_max_temperature_emos(
             "insufficient daily-max EMOS data; need at least "
             f"{required_training_dates} dates per group ({details})"
         )
-    for key, count in sorted(insufficient.items()):
+    if insufficient:
+        sorted_insufficient = sorted(insufficient.items())
+        preview_limit = 5
+        preview = ", ".join(
+            f"{key!r}: only {count} training date(s)"
+            for key, count in sorted_insufficient[:preview_limit]
+        )
+        omitted_count = len(sorted_insufficient) - preview_limit
+        omitted_suffix = (
+            f", and {omitted_count} more"
+            if omitted_count > 0
+            else ""
+        )
         logger.warning(
-            "Skipping daily-max EMOS group %r: only %d training date(s); "
-            "need at least %d",
-            key,
-            count,
+            "Skipping %d insufficient daily-max EMOS group(s); "
+            "need at least %d. %s%s",
+            len(insufficient),
             required_training_dates,
+            preview,
+            omitted_suffix,
         )
 
     fits: dict[DailyMaxGroupKey, Any] = {}

@@ -1,7 +1,9 @@
 """Integration tests for the Python-to-R EMOS bridge."""
 
+import io
 import math
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -233,15 +235,18 @@ class EnsembleMosTest(unittest.TestCase):
     def test_ensemble_mos_runs_with_mock_temperature_data(self):
         ensemble_data, dates = make_mock_ensemble_data()
 
-        result = ensemble_mos(
-            ensemble_data,
-            training_days=14,
-            dates=vectors.StrVector((dates[-1],)),
-        )
+        console_output = io.StringIO()
+        with redirect_stdout(console_output):
+            result = ensemble_mos(
+                ensemble_data,
+                training_days=14,
+                dates=vectors.StrVector((dates[-1],)),
+            )
 
         result_classes = set(robjects.r["class"](result))  # type: ignore
         self.assertIn("ensembleMOSnormal", result_classes)
         self.assertTrue({"training", "a", "B", "c", "d"}.issubset(result.names))
+        self.assertNotIn("modeling for date", console_output.getvalue())
 
         for parameter_name in ("a", "B", "c", "d"):
             parameter_values = result.rx2(parameter_name)

@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 from rpy2 import rinterface, robjects
+from rpy2.rinterface_lib import callbacks
 from rpy2.robjects import vectors
 from rpy2.robjects.packages import importr
 
@@ -385,7 +386,15 @@ def ensemble_mos(
     if control is not None and control is not rinterface.NULL:
         arguments["control"] = control
 
-    return ensemble_mos_package.ensembleMOS(ensemble_data, **arguments)
+    # ensembleMOS prints every modeling date and its complete coefficient
+    # vector. Keep warnings/errors visible, but hide that verbose progress
+    # output so one concise Python log line can represent a completed model.
+    with callbacks.replace_in_module(
+        callbacks,
+        "consolewrite_print",
+        lambda _message: None,
+    ):
+        return ensemble_mos_package.ensembleMOS(ensemble_data, **arguments)
 
 
 def train_grouped_ensemble_mos(

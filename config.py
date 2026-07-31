@@ -1,3 +1,9 @@
+UPDATE_FORECAST_INTERVAL = 600
+UPDATE_TEMPERATURE_INTERVAL = 600
+TRAIN_MODEL_INTERVAL = 3600 * 3
+AUTO_TRAIN = True
+AUTO_PREDICT = True
+
 CITY = [
     {
         "name": "Chongqing-ZUCK",
@@ -91,7 +97,3 @@ CITY = [
         "slug_prefix": "highest-temperature-in-madrid",
     },
 ]
-
-UPDATE_FORECAST_INTERVAL = 600
-UPDATE_TEMPERATURE_INTERVAL = 600
-TRAIN_MODEL_INTERVAL = 3600 * 3

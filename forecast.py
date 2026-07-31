@@ -137,7 +137,7 @@ def _update_forecasts_once():
                 )
                 continue
 
-            if updated is not True:
+            if updated is not True or not config.AUTO_TRAIN:
                 continue
 
             try:
@@ -154,7 +154,7 @@ def _update_forecasts_once():
                 )
             except Exception:
                 logging.exception(
-                    "Forecast updated but failed to train daily-max EMOS " "for %s/%s",
+                    "Forecast updated but failed to train daily-max EMOS for %s/%s",
                     city_name,
                     model_name,
                 )
