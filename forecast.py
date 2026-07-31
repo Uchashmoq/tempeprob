@@ -13,6 +13,7 @@ import predict_emos_max_temperature
 import train_emos_max_temperature
 
 latest_forecast: dict[str, dict] = {}
+MAX_LOGGED_RESPONSE_BODY_CHARS = 4096
 _FORECAST_POSTPROCESS_EXECUTOR = ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="forecast-postprocess",
@@ -260,6 +261,55 @@ def _schedule_updated_forecast_postprocessing(
     return future
 
 
+def _response_body_for_log(response_body: str) -> str:
+    if len(response_body) <= MAX_LOGGED_RESPONSE_BODY_CHARS:
+        return response_body
+    omitted = len(response_body) - MAX_LOGGED_RESPONSE_BODY_CHARS
+    return (
+        response_body[:MAX_LOGGED_RESPONSE_BODY_CHARS]
+        + f"... <{omitted} character(s) omitted>"
+    )
+
+
+def _log_forecast_update_failure(
+    city_name: str,
+    model_name: str,
+    error: Exception,
+) -> None:
+    """Write one readable error line without exception traceback output."""
+    if isinstance(error, data_source.OpenMeteoForecastError):
+        status = (
+            "unavailable"
+            if error.status_code is None
+            else str(error.status_code)
+        )
+        response_body = (
+            "<unavailable>"
+            if error.response_body is None
+            else repr(_response_body_for_log(error.response_body))
+        )
+        logging.error(
+            "Failed to update forecast for %s/%s: stage=%s; reason=%s; "
+            "HTTP status=%s; response_body=%s",
+            city_name,
+            model_name,
+            error.stage,
+            error,
+            status,
+            response_body,
+        )
+        return
+
+    error_text = " ".join(str(error).splitlines())
+    logging.error(
+        "Failed to update forecast for %s/%s: %s: %s",
+        city_name,
+        model_name,
+        type(error).__name__,
+        error_text,
+    )
+
+
 def _update_forecasts_once():
     """Update forecasts and queue post-processing for each changed model."""
     for city in config.CITY:
@@ -268,11 +318,11 @@ def _update_forecasts_once():
             model_name = model["name"]
             try:
                 updated = update_forecast(city, model_name)
-            except Exception:
-                logging.exception(
-                    "Failed to update forecast for %s/%s",
+            except Exception as error:
+                _log_forecast_update_failure(
                     city_name,
                     model_name,
+                    error,
                 )
                 continue
 

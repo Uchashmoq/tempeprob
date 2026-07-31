@@ -6,6 +6,7 @@ import time
 import config
 
 latest_temperature: dict[str, dict] = {}
+MAX_LOGGED_RESPONSE_BODY_CHARS = 4096
 
 
 def get_latest_temperature(city_name):
@@ -56,12 +57,49 @@ def update_temperature(city):
     if city_name not in latest_temperature:
         latest_temperature[city_name] = {}
     ltem = latest_temperature[city_name]
-    if _tem_eq(tem, ltem):
+    if ltem and _tem_eq(tem, ltem):
         return False
     save_temperature(city_name, tem)
     latest_temperature[city_name] = tem
     logging.info("Updated temperature for %s: %s", city_name, tem)
     return True
+
+
+def _response_body_for_log(response_body: str) -> str:
+    if len(response_body) <= MAX_LOGGED_RESPONSE_BODY_CHARS:
+        return response_body
+    omitted = len(response_body) - MAX_LOGGED_RESPONSE_BODY_CHARS
+    return (
+        response_body[:MAX_LOGGED_RESPONSE_BODY_CHARS]
+        + f"... <{omitted} character(s) omitted>"
+    )
+
+
+def _update_temperature_safely(city) -> bool:
+    """Update one city and log failures without emitting a traceback."""
+    city_name = city.get("name", "<unknown>")
+    icao = city.get("ICAO", "<unknown>")
+    try:
+        return update_temperature(city)
+    except data_source.AviationWeatherResponseError as error:
+        logging.error(
+            "Failed to update temperature for %s (%s): %s; "
+            "HTTP status=%s; response_body=%r",
+            city_name,
+            icao,
+            error,
+            error.status_code,
+            _response_body_for_log(error.response_body),
+        )
+    except Exception as error:
+        logging.error(
+            "Failed to update temperature for %s (%s): %s: %s",
+            city_name,
+            icao,
+            type(error).__name__,
+            error,
+        )
+    return False
 
 
 def update_temperature_periotically():
@@ -75,9 +113,6 @@ def update_temperature_periotically():
 
     while True:
         for city in config.CITY:
-            try:
-                update_temperature(city)
-            except Exception:
-                logging.exception("Failed to update temperatures")
+            _update_temperature_safely(city)
 
         time.sleep(config.UPDATE_TEMPERATURE_INTERVAL)

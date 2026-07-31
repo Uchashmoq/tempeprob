@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import data_source
 import forecast
 
 
@@ -225,9 +226,63 @@ class ForecastPeriodicUpdateTest(unittest.TestCase):
         trainer.assert_called_once()
         self.assertEqual(trainer.call_args.args[:2], ("City-One", "model-b"))
         self.assertIn(
-            "Failed to update forecast for City-One/model-a",
+            "Failed to update forecast for City-One/model-a: "
+            "RuntimeError: download failed",
             "\n".join(error_logs.output),
         )
+        self.assertNotIn("Traceback", "\n".join(error_logs.output))
+
+    def test_open_meteo_error_logs_readable_response_without_traceback(self):
+        error = data_source.OpenMeteoForecastError(
+            "Open-Meteo returned invalid JSON",
+            stage="forecast metadata",
+            status_code=502,
+            response_body="<html>Bad Gateway</html>",
+        )
+
+        with (
+            patch.object(forecast.config, "CITY", self.cities),
+            patch.object(forecast.config, "AUTO_TRAIN", False),
+            patch.object(forecast.config, "AUTO_PREDICT", False),
+            patch.object(
+                forecast,
+                "update_forecast",
+                side_effect=[error, False],
+            ),
+            self.assertLogs(level="ERROR") as error_logs,
+        ):
+            forecast._update_forecasts_once()
+
+        output = "\n".join(error_logs.output)
+        self.assertIn("City-One/model-a", output)
+        self.assertIn("stage=forecast metadata", output)
+        self.assertIn("reason=Open-Meteo returned invalid JSON", output)
+        self.assertIn("HTTP status=502", output)
+        self.assertIn("response_body='<html>Bad Gateway</html>'", output)
+        self.assertNotIn("Traceback", output)
+
+    def test_connection_error_log_marks_response_as_unavailable(self):
+        error = data_source.OpenMeteoForecastError(
+            "ConnectionError: connection reset by peer",
+            stage="forecast metadata",
+        )
+
+        with self.assertLogs(level="ERROR") as error_logs:
+            forecast._log_forecast_update_failure(
+                "Wuhan-ZHHH",
+                "ecmwf_aifs025_ensemble",
+                error,
+            )
+
+        output = "\n".join(error_logs.output)
+        self.assertIn(
+            "Wuhan-ZHHH/ecmwf_aifs025_ensemble",
+            output,
+        )
+        self.assertIn("ConnectionError: connection reset by peer", output)
+        self.assertIn("HTTP status=unavailable", output)
+        self.assertIn("response_body=<unavailable>", output)
+        self.assertNotIn("Traceback", output)
 
     def test_does_not_train_when_auto_train_is_disabled(self):
         with (
