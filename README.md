@@ -21,6 +21,10 @@ remain visible and the market columns show an unavailable status.
 venv/bin/python web_server.py
 ```
 
+Application, collection, and HTTP access logs are printed to the console and
+appended to `log.txt` in the project root. Select another file with
+`--log-file`.
+
 The built-in server listens on all network interfaces by default. Open
 `http://SERVER_IP:8001`, or <http://127.0.0.1:8001> from the server itself.
 Optional arguments:
@@ -29,7 +33,8 @@ Optional arguments:
 venv/bin/python web_server.py \
   --host 0.0.0.0 \
   --port 8001 \
-  --prediction-dir prediction/highest_temperature_emos
+  --prediction-dir prediction/highest_temperature_emos \
+  --log-file log.txt
 ```
 
 Use `--host 127.0.0.1` when the dashboard should only be reachable locally or

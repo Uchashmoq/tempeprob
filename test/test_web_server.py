@@ -1,6 +1,7 @@
 """Tests for the read-only Bottle prediction dashboard."""
 
 import json
+import logging
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
@@ -10,9 +11,11 @@ from urllib.parse import quote
 from wsgiref.util import setup_testing_defaults
 
 from web_server import (
+    DEFAULT_LOG_FILE,
     IntervalView,
     PREDICTION_RECORD_TYPE,
     PolymarketPriceCache,
+    _configure_logging,
     create_app,
     load_latest_temperature_observations,
     load_prediction_catalog,
@@ -671,6 +674,34 @@ class WebServerRouteTest(unittest.TestCase):
 
 
 class WebServerCommandTest(unittest.TestCase):
+    def test_configure_logging_uses_console_and_append_file(self):
+        with TemporaryDirectory() as temporary_directory:
+            log_file = Path(temporary_directory) / "logs" / "web.log"
+            with (
+                patch("web_server.logging.StreamHandler") as stream_handler,
+                patch("web_server.logging.FileHandler") as file_handler,
+                patch("web_server.logging.basicConfig") as basic_config,
+            ):
+                _configure_logging(log_file)
+                self.assertTrue(log_file.parent.is_dir())
+
+        stream_handler.assert_called_once_with()
+        file_handler.assert_called_once_with(
+            log_file,
+            mode="a",
+            encoding="utf-8",
+        )
+        basic_config.assert_called_once_with(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            handlers=(
+                stream_handler.return_value,
+                file_handler.return_value,
+            ),
+            force=True,
+        )
+
     def test_collect_option_starts_background_collectors_before_server(self):
         bottle_app = MagicMock()
 
@@ -682,7 +713,7 @@ class WebServerCommandTest(unittest.TestCase):
             patch(
                 "web_server._start_background_collection",
             ) as start_collection,
-            patch("web_server.logging.basicConfig") as configure_logging,
+            patch("web_server._configure_logging") as configure_logging,
         ):
             main(
                 [
@@ -692,18 +723,21 @@ class WebServerCommandTest(unittest.TestCase):
                     "9000",
                     "--prediction-dir",
                     "custom-predictions",
+                    "--log-file",
+                    "custom-log.txt",
                     "--collect",
                 ]
             )
 
         create.assert_called_once_with(Path("custom-predictions"))
-        configure_logging.assert_called_once()
+        configure_logging.assert_called_once_with(Path("custom-log.txt"))
         start_collection.assert_called_once_with()
         bottle_app.run.assert_called_once_with(
             host="0.0.0.0",
             port=9000,
             debug=False,
             reloader=False,
+            quiet=True,
         )
 
     def test_collectors_are_not_started_without_option(self):
@@ -717,15 +751,18 @@ class WebServerCommandTest(unittest.TestCase):
             patch(
                 "web_server._start_background_collection",
             ) as start_collection,
+            patch("web_server._configure_logging") as configure_logging,
         ):
             main([])
 
+        configure_logging.assert_called_once_with(DEFAULT_LOG_FILE)
         start_collection.assert_not_called()
         bottle_app.run.assert_called_once_with(
             host="0.0.0.0",
             port=8001,
             debug=False,
             reloader=False,
+            quiet=True,
         )
 
 

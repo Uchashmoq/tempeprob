@@ -38,6 +38,7 @@ from polymarket import (
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_PREDICTION_DIR = PROJECT_DIR / "prediction" / "highest_temperature_emos"
 DEFAULT_TEMPERATURE_DIR = PROJECT_DIR / "data" / "temperature"
+DEFAULT_LOG_FILE = PROJECT_DIR / "log.txt"
 TEMPLATE_DIR = PROJECT_DIR / "web" / "templates"
 STATIC_DIR = PROJECT_DIR / "web" / "static"
 DEFAULT_MARKET_PRICE_TIMEOUT_SECONDS = 5.0
@@ -1355,6 +1356,19 @@ def create_app(
             "frame-ancestors 'none'; form-action 'self'",
         )
 
+    @bottle_app.hook("after_request")
+    def log_request() -> None:
+        target = request.path
+        if request.query_string:
+            target = f"{target}?{request.query_string}"
+        logging.info(
+            "HTTP %s %s %s %s",
+            request.remote_addr or "-",
+            request.method,
+            target,
+            response.status_code,
+        )
+
     @bottle_app.get("/")  # type: ignore
     def dashboard() -> str:
         return _render_dashboard(
@@ -1468,6 +1482,22 @@ def _start_background_collection() -> None:
     start_collection_threads(daemon=True)
 
 
+def _configure_logging(log_file: str | Path = DEFAULT_LOG_FILE) -> None:
+    """Send application and access logs to both stderr and a UTF-8 file."""
+    path = Path(log_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=(
+            logging.StreamHandler(),
+            logging.FileHandler(path, mode="a", encoding="utf-8"),
+        ),
+        force=True,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Serve the saved EMOS prediction dashboard.",
@@ -1484,6 +1514,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         default=DEFAULT_PREDICTION_DIR,
     )
     parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=DEFAULT_LOG_FILE,
+        help="append logs to this file (default: project log.txt)",
+    )
+    parser.add_argument(
         "--collect",
         action="store_true",
         help=(
@@ -1492,19 +1528,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
     )
     arguments = parser.parse_args(argv)
+    _configure_logging(arguments.log_file)
     bottle_app = create_app(arguments.prediction_dir)
     if arguments.collect:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
         _start_background_collection()
+    logging.info(
+        "Starting web server on http://%s:%d/ (collect=%s, log_file=%s)",
+        arguments.host,
+        arguments.port,
+        arguments.collect,
+        arguments.log_file,
+    )
     bottle_app.run(
         host=arguments.host,
         port=arguments.port,
         debug=False,
         reloader=False,
+        quiet=True,
     )
 
 
