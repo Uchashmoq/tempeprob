@@ -427,14 +427,22 @@ a:focus-visible {
 
 .city-heading {
   align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 20px;
   margin-bottom: 12px;
 }
 
-.city-heading > div {
+.city-heading-primary,
+.city-heading-actions {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 7px 12px;
+}
+
+.city-heading-actions {
+  justify-content: flex-end;
+  margin-left: auto;
 }
 
 .city-heading h3 {
@@ -445,6 +453,10 @@ a:focus-visible {
 .city-heading a {
   color: var(--teal);
   font-size: 12px;
+}
+
+.city-heading .city-only-link {
+  white-space: nowrap;
 }
 
 .city-heading .city-market-link {

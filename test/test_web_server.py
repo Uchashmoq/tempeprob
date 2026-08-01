@@ -465,6 +465,9 @@ class WebServerRouteTest(unittest.TestCase):
         self.assertIn("Polymarket Yes", dashboard)
         self.assertIn("40.0%", dashboard)
         self.assertIn("+40.0 pp", dashboard)
+        city_only_links = anchors_with_class(dashboard, "city-only-link")
+        self.assertEqual(len(city_only_links), 1)
+        self.assertEqual(city_only_links[0]["href"], f"/city/{CITY}")
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertIn(
             "default-src 'self'",
@@ -489,6 +492,7 @@ class WebServerRouteTest(unittest.TestCase):
         self.assertTrue(css_status.startswith("200"))
         self.assertTrue(css_headers["Content-Type"].startswith("text/css"))
         self.assertIn(".prediction-card", css_body)
+        self.assertIn(".city-heading-actions", css_body)
         fetch_market.assert_called_once_with(EVENT_SLUG, timeout=5.0)
 
     def test_dashboard_deduplicates_market_fetch_and_compares_two_models(self):

@@ -154,7 +154,7 @@
   % for city in day["cities"]:
   <section class="city-section">
     <header class="city-heading">
-      <div>
+      <div class="city-heading-primary">
         <h3>{{city["city_label"]}}</h3>
         % if city["market_url"]:
         <a
@@ -165,11 +165,13 @@
           aria-label="打开 {{city['city_label']}} {{day['target_date']}} 的 Polymarket 市场（新窗口）"
         >Polymarket 市场 <span aria-hidden="true">↗</span></a>
         % end
-        <a href="{{city['city_url']}}">仅查看该城市</a>
       </div>
-      % if city["boundary_mismatch"]:
-      <span class="boundary-warning">模型市场边界不一致</span>
-      % end
+      <div class="city-heading-actions">
+        % if city["boundary_mismatch"]:
+        <span class="boundary-warning">模型市场边界不一致</span>
+        % end
+        <a class="city-only-link" href="{{city['city_url']}}">仅查看该城市</a>
+      </div>
     </header>
 
     <div class="model-grid">
