@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
@@ -24,6 +25,7 @@ CITY = "City-ZZZZ"
 MODEL = "model-a"
 TARGET_DATE = "2026-08-01"
 EVENT_SLUG = "highest-temperature-in-city-on-august-1-2026"
+EVENT_URL = f"https://polymarket.com/event/{EVENT_SLUG}"
 
 
 def make_record(
@@ -33,6 +35,7 @@ def make_record(
     model_name: str = MODEL,
     target_date: str = TARGET_DATE,
     generated_at: str = "2026-07-31T04:00:00.000000Z",
+    event_slug: str = EVENT_SLUG,
     probabilities: tuple[float, float] = (0.25, 0.75),
     first_label: str = "T < 30°C",
 ) -> dict:
@@ -47,7 +50,7 @@ def make_record(
         "target_date_local": target_date,
         "market": {
             "slug_prefix": "highest-temperature-in-city",
-            "event_slug": EVENT_SLUG,
+            "event_slug": event_slug,
             "boundaries": [30.0],
             "unit": "celsius",
             "fetched_at_utc": "2026-07-31T03:59:00.000000Z",
@@ -107,6 +110,7 @@ def make_record(
 
 def make_market_event(
     *,
+    event_slug: str = EVENT_SLUG,
     yes_prices: tuple[float, float] = (0.4, 0.6),
     titles: tuple[str, str] = (
         "29°C or below",
@@ -115,11 +119,11 @@ def make_market_event(
 ) -> dict:
     return {
         "id": "event-1",
-        "slug": EVENT_SLUG,
+        "slug": event_slug,
         "markets": [
             {
                 "id": f"market-{index}",
-                "slug": f"{EVENT_SLUG}-{index}",
+                "slug": f"{event_slug}-{index}",
                 "groupItemTitle": title,
                 "outcomes": json.dumps(["Yes", "No"]),
                 "outcomePrices": json.dumps(
@@ -202,6 +206,32 @@ def wsgi_get(app, path: str, query: str = ""):
         if close is not None:
             close()
     return captured["status"], captured["headers"], body
+
+
+class _AnchorCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchors: list[dict[str, str]] = []
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if tag == "a":
+            self.anchors.append(
+                {name: value or "" for name, value in attrs}
+            )
+
+
+def anchors_with_class(html: str, class_name: str) -> list[dict[str, str]]:
+    collector = _AnchorCollector()
+    collector.feed(html)
+    return [
+        anchor
+        for anchor in collector.anchors
+        if class_name in anchor.get("class", "").split()
+    ]
 
 
 class PredictionCatalogTest(unittest.TestCase):
@@ -491,8 +521,80 @@ class WebServerRouteTest(unittest.TestCase):
         self.assertIn("Polymarket Yes", dashboard)
         self.assertIn("-15.0 pp", dashboard)
         self.assertIn("+15.0 pp", dashboard)
+        market_links = anchors_with_class(dashboard, "city-market-link")
+        self.assertEqual(len(market_links), 1)
+        self.assertEqual(market_links[0]["href"], EVENT_URL)
         self.assertEqual(before, after)
         fetch_market.assert_called_once_with(EVENT_SLUG, timeout=5.0)
+
+    def test_city_market_link_uses_selected_target_date(self):
+        august_2_slug = "highest-temperature-in-city-on-august-2-2026"
+        august_2_url = f"https://polymarket.com/event/{august_2_slug}"
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            write_records(
+                root,
+                [
+                    make_record(),
+                    make_record(
+                        prediction_id="b" * 64,
+                        target_date="2026-08-02",
+                        event_slug=august_2_slug,
+                    ),
+                ],
+            )
+            market_price_cache, _ = make_market_price_cache(
+                event=make_market_event(event_slug=august_2_slug),
+            )
+
+            status, _, dashboard = wsgi_get(
+                create_app(root, market_price_cache=market_price_cache),
+                "/",
+                query="city=&date=2026-08-02&model=",
+            )
+
+        self.assertTrue(status.startswith("200"))
+        market_links = anchors_with_class(dashboard, "city-market-link")
+        self.assertEqual(len(market_links), 1)
+        self.assertEqual(market_links[0]["href"], august_2_url)
+        self.assertEqual(market_links[0]["target"], "_blank")
+        self.assertEqual(
+            set(market_links[0]["rel"].split()),
+            {"noopener", "noreferrer"},
+        )
+        self.assertIn("2026-08-02", market_links[0]["aria-label"])
+        self.assertNotIn(EVENT_URL, dashboard)
+
+    def test_city_market_link_hides_model_slug_conflict_even_when_filtered(self):
+        conflicting_slug = (
+            "highest-temperature-in-city-conflict-on-august-1-2026"
+        )
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            write_records(root, [make_record()])
+            write_records(
+                root,
+                [
+                    make_record(
+                        prediction_id="b" * 64,
+                        model_name="model-b",
+                        event_slug=conflicting_slug,
+                    )
+                ],
+                model_name="model-b",
+            )
+            market_price_cache = MagicMock()
+            market_price_cache.get_many.return_value = {}
+
+            status, _, dashboard = wsgi_get(
+                create_app(root, market_price_cache=market_price_cache),
+                "/",
+                query="model=model-a",
+            )
+
+        self.assertTrue(status.startswith("200"))
+        self.assertIn('<option value="model-a" selected>', dashboard)
+        self.assertFalse(anchors_with_class(dashboard, "city-market-link"))
 
     def test_market_api_failure_keeps_saved_prediction_visible(self):
         with TemporaryDirectory() as temporary_directory:

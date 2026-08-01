@@ -432,8 +432,9 @@ a:focus-visible {
 
 .city-heading > div {
   display: flex;
-  align-items: baseline;
-  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px 12px;
 }
 
 .city-heading h3 {
@@ -444,6 +445,24 @@ a:focus-visible {
 .city-heading a {
   color: var(--teal);
   font-size: 12px;
+}
+
+.city-heading .city-market-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border: 1px solid #c8dfdb;
+  border-radius: 999px;
+  background: var(--teal-soft);
+  font-size: 11px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.city-heading .city-market-link:hover {
+  border-color: #94c3bc;
+  background: #dceeea;
 }
 
 .boundary-warning {

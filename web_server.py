@@ -1157,6 +1157,29 @@ def _dashboard_groups(
             history_counts.get(historical_record.series_key, 0) + 1
         )
 
+    latest_records_by_city_date: dict[
+        tuple[str, date],
+        list[PredictionRecord],
+    ] = {}
+    for latest_record in catalog.latest_records:
+        latest_records_by_city_date.setdefault(
+            (latest_record.city_name, latest_record.target_date),
+            [],
+        ).append(latest_record)
+
+    market_url_by_city_date: dict[tuple[str, date], str] = {}
+    for key, group_records in latest_records_by_city_date.items():
+        market_urls = [record.market_url for record in group_records]
+        unique_market_urls = {
+            market_url for market_url in market_urls if market_url is not None
+        }
+        if (
+            market_urls
+            and all(market_url is not None for market_url in market_urls)
+            and len(unique_market_urls) == 1
+        ):
+            market_url_by_city_date[key] = next(iter(unique_market_urls))
+
     by_date: dict[date, dict[str, list[PredictionRecord]]] = {}
     for record in records:
         by_date.setdefault(record.target_date, {}).setdefault(
@@ -1178,6 +1201,9 @@ def _dashboard_groups(
                     "city_name": city_name,
                     "city_label": _city_label(city_name),
                     "city_url": f"/city/{quote(city_name, safe='')}",
+                    "market_url": market_url_by_city_date.get(
+                        (city_name, target_date)
+                    ),
                     "records": [
                         {
                             "record": record,

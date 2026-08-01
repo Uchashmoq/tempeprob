@@ -156,6 +156,15 @@
     <header class="city-heading">
       <div>
         <h3>{{city["city_label"]}}</h3>
+        % if city["market_url"]:
+        <a
+          class="city-market-link"
+          href="{{city['market_url']}}"
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label="打开 {{city['city_label']}} {{day['target_date']}} 的 Polymarket 市场（新窗口）"
+        >Polymarket 市场 <span aria-hidden="true">↗</span></a>
+        % end
         <a href="{{city['city_url']}}">仅查看该城市</a>
       </div>
       % if city["boundary_mismatch"]:
