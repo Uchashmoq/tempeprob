@@ -261,3 +261,131 @@ does not need to be installed under `/opt`. To select another R library:
     ],
 }
 ```
+
+## Future Work
+
+结论：当前最值得做的是“扩展 METAR + 扩展同一起报的 ECMWF 辅助变量”，然后使用带正则化的多协变量 NGR/EMOS。暂时不建议直接上随机森林或神经网络，现有样本量太少。
+
+### 1. 优先加入的观测数据
+
+当前 [aviationweather_temp()](/Users/mhr/Documents/tempeprob/data_source.py:200) 请求的 METAR 实际包含很多字段，但代码只保存了温度、观测时间和接收时间。
+
+| 优先级 | METAR 字段 | 建议衍生特征 | 主要作用 |
+|---|---|---|---|
+| 最高 | `dewp` 露点 | `temperature - dewpoint`、相对湿度 | 湿度、蒸发冷却、闷热天气 |
+| 最高 | `wdir/wspd/wgst` | 风的 `u/v` 分量、最大风速 | 混合、平流、海陆风 |
+| 最高 | `clouds/cover` | 低云量、最低 BKN/OVC 云底 | 判断日照能否把最高温推高 |
+| 高 | `wxString` | 雨、雪、雾、雷暴标记 | 云雨降温、边界层状态 |
+| 高 | `precip/pcp3hr/pcp6hr/pcp24hr` | 过去1～24小时降水 | 湿土、蒸发冷却 |
+| 高 | `altim/slp/presTend` | 气压及3小时变化 | 锋面、气团转换 |
+| 中 | `visib` | 低能见度/雾标记 | 低云、雾、气溶胶代理 |
+| 冬季重要 | `snow`、降雪现象 | 雪深、是否有积雪 | 反照率、融雪、夜间逆温 |
+| 审计 | `rawOb/qcField/metarType` | 原始报文、质量标记 | 修订追踪和重新解析 |
+
+这些字段来自同一次请求，不增加 API 调用次数。METAR 官方说明其主体包含风、能见度、天气现象、云况、温度、露点和气压，[AviationWeather METAR 文档](https://aviationweather.gov/help/data/)也说明部分站点还会报告降水、积雪和更高精度温度。
+
+需要注意：
+
+- 字段缺失不能当成零，特别是降水和积雪。
+- `wdir` 可能是 `VRB`，`visib` 可能是 `6+`，需要允许混合类型。
+- 当前 [_tem_eq()](/Users/mhr/Documents/tempeprob/observation.py:49) 只比较温度和时刻。加入新字段后，应改为按 `ICAO + obsTime + receiptTime/rawOb` 去重，否则温度未变但云、风被修订的记录会被吞掉。
+- AviationWeather 在线接口只能回看约15天，因此要从现在开始自行归档。[官方 API 说明](https://aviationweather.gov/data/api/)
+
+### 2. 同时加入 ECMWF 辅助预报
+
+未来的云、风、土壤和雪无法提前观测，所以训练和预测还需要保存“同一次起报”中的：
+
+- `dew_point_2m`、`relative_humidity_2m`
+- `cloud_cover`、`cloud_cover_low`
+- `shortwave_radiation`、`sunshine_duration`
+- `wind_speed_10m`、`wind_direction_10m`
+- `precipitation`、`snowfall`、`snow_depth`
+- `surface_temperature`
+- 浅层土壤温度、土壤湿度
+- 925/850 hPa 温度、湿度、风、位势高度
+
+Open-Meteo Ensemble API 支持其中多数变量，但要确认每个 ECMWF 模型实际返回哪些字段。[变量清单](https://open-meteo.com/en/docs/ensemble-api)和[ECMWF Open Data 参数表](https://www.ecmwf.int/en/forecasts/datasets/open-data)均包含这些地面和高空变量。
+
+日最高温特征建议这样聚合：
+
+- 每个成员先求自己的日最高温，再计算成员均值和离散度。
+- 白昼云量取当地约 09–18 时均值。
+- 短波辐射取白昼积分。
+- 风向转为 `u/v`，避免 359° 和 1° 被当成差异很大。
+- 降水取目标日前24小时及目标日累计。
+- 雪深、土壤湿度取目标日早晨或起报时状态。
+
+不要先把51个成员平均再求最高温，这会压低极值和集合离散度。
+
+### 3. 推荐的修正算法
+
+最适合当前项目的是正则化的多协变量高斯 NGR：
+
+\[
+T_{\max}\sim N(\mu,\sigma^2)
+\]
+
+均值模型：
+
+\[
+\mu =
+\beta_0+
+\beta_1\overline{T_{\max}}+
+\beta_2(T-T_d)+
+\beta_3 Cloud+
+\beta_4 Radiation+
+\beta_5 Wind_{u,v}+
+\beta_6 Precip+
+\beta_7 RecentBias
+\]
+
+方差模型：
+
+\[
+\log \sigma =
+\gamma_0+
+\gamma_1\log(Spread_{T_{\max}}+\epsilon)+
+\gamma_2 CloudSpread+
+\gamma_3 WindSpread
+\]
+
+建议：
+
+- 用负对数似然或 CRPS 优化。
+- 对系数使用 ridge 或 elastic-net。
+- 初期只新增露点差、白昼云量/辐射、风、近期偏差这3～4组特征。
+- 多城市共同训练，使用城市、起报时次和 `day_ahead` 截距或分层效应，避免继续把少量数据切成大量小组。
+
+当前 `ensembleMOS` 的正态模型固定为：
+
+\[
+N(a+\sum b_iX_i,\ c+dS^2)
+\]
+
+它没有独立外生协变量接口。[ensembleMOS 手册](https://cran.r-project.org/web/packages/ensembleMOS/ensembleMOS.pdf) 因此不能把露点、云量、风速直接伪装成“集合成员”，否则单位和集合方差都会错误。
+
+有两种实现方式：
+
+1. 推荐：自己实现上述带 ridge 的高斯分布回归，同时拟合 `mu` 和 `sigma`。
+2. 改动较小：先保留现有 EMOS，再用 ridge/GAM 学习其滚动验证残差：
+   `最终均值 = EMOS均值 + 辅助特征预测的残差`，同时再校准方差。残差模型必须使用 out-of-fold EMOS 结果训练，不能使用同一批数据的拟合内残差。
+
+ECMWF 的研究中，线性回归、随机森林和神经网络对2米温度误差的改善接近，因此当前阶段简单、正则化、可解释的模型更合适。[ECMWF Technical Memorandum 896](https://www.ecmwf.int/en/elibrary/81297-statistical-modelling-2m-temperature-and-10m-wind-speed-forecast-errors)
+
+### 4. 必须防止的数据泄漏
+
+预测生成时刻为 `cutoff` 时：
+
+允许使用：
+
+- 同一次起报中目标日的云、风、降水等预报；
+- `update_time <= cutoff` 的真实观测；
+- 历史滚动偏差、站点地形和季节特征。
+
+禁止使用：
+
+- `cutoff` 之后的目标日真实云量、风、露点或降水；
+- 事后生成的 ERA5/ERA5-Land，却假装起报时已经可用；
+- 目标日结束后才知道的完整日观测特征。
+
+预测“今天”时，可以加入 `max_temperature_observed_so_far`，最终分布必须保证低于当前已观测最高温的概率为零。预测明天、后天时则不能使用这些未来观测。
